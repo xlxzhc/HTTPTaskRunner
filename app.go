@@ -889,8 +889,8 @@ func (a *App) ExecuteCardPackageWithContext(
 		summary = fmt.Sprintf("Completed %d requests in %dms (%.2f req/s). Average delay: %.2fms",
 			times, elapsedMs, float64(times)/(float64(elapsedMs)/1000), avgDelay)
 	} else {
-		summary = fmt.Sprintf("Completed %d requests in %dms (%.2f req/s)",
-			times, elapsedMs, float64(times)/(float64(elapsedMs)/1000))
+		summary = fmt.Sprintf("Completed %d requests in %dms (%.2f req/s) \n %s",
+			times, elapsedMs, float64(times)/(float64(elapsedMs)/1000), results)
 	}
 
 	return summary

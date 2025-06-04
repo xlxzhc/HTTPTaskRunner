@@ -995,7 +995,7 @@ import {
   ExportTasksByIDs, ExportTasksByTags, OpenSaveFileDialog, OpenFileDialog, 
   SaveTaskLogs, LoadTaskLogs, ClearTaskLogs, DeleteOldTaskLogs, EnsureLogDirectory
 } from '../wailsjs/go/main/App';
-import { debounce } from 'lodash-es';
+// import { debounce } from 'lodash-es';
 
 // Types
 interface Task {
@@ -2933,7 +2933,7 @@ function debounce(fn: Function, delay: number) {
 
 // Mock file system functions for now (these would be replaced with actual Wails bindings)
 async function getHomeDir() {
-  return os.homedir ? os.homedir() : '.';
+  // return os.homedir ? os.homedir() : '.';
 }
 
 async function ensureDir(dir: string) {
