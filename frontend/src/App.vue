@@ -993,7 +993,8 @@ import {
   SendRequest, ExecuteCardPackage, SaveTask, GetAllTasks, GetTaskByID, UpdateTask, 
   DeleteTask, ExportTasks, ImportTasks, StopTask, TestTask, ExecuteTask, GetTaskProgress,
   ExportTasksByIDs, ExportTasksByTags, OpenSaveFileDialog, OpenFileDialog, 
-  SaveTaskLogs, LoadTaskLogs, ClearTaskLogs, DeleteOldTaskLogs, EnsureLogDirectory
+  SaveTaskLogs, LoadTaskLogs, ClearTaskLogs, DeleteOldTaskLogs, EnsureLogDirectory,
+  GetTotalTasks, GetTotalLogs
 } from '../wailsjs/go/main/App';
 // import { debounce } from 'lodash-es';
 
@@ -1088,6 +1089,47 @@ const showTaskLogsModal = ref(false);
 const currentTaskLogId = ref<string | null>(null);
 const logRetentionDays = ref('7');
 const taskLogsPath = ref('');
+
+// 分页相关状态
+const currentPage = ref(1);
+const pageSize = ref(10);
+const totalTasks = ref(0);
+
+// 日志分页相关状态
+const currentLogPage = ref(1);
+const logPageSize = ref(50);
+const totalLogs = ref(0);
+
+// 加载任务列表
+const loadTasks = async (page: number = currentPage.value, size: number = pageSize.value) => {
+  try {
+    const [tasksData, total] = await Promise.all([
+      GetAllTasks(page, size),
+      GetTotalTasks()
+    ]);
+    
+    if (!tasksData) {
+      console.error('加载任务列表失败: 返回数据为空');
+      return;
+    }
+    
+    tasks.value = tasksData;
+    totalTasks.value = total;
+  } catch (error) {
+    console.error('加载任务列表失败:', error);
+    outputLog.value += getCurrentTime() + ` 加载任务列表失败: ${error}\n`;
+  }
+};
+
+// 监听分页变化
+watch([currentPage, pageSize], () => {
+  loadTasks(currentPage.value, pageSize.value);
+});
+
+// 在组件挂载时加载任务
+onMounted(async () => {
+  await loadTasks(1, pageSize.value);
+});
 
 // Auto-scroll logs when enabled
 watch(outputLog, () => {
@@ -1361,16 +1403,6 @@ function validateDelayInput() {
     delayMax.value = '0';
   } else if (max < min) {
     delayMax.value = delayMin.value;
-  }
-}
-
-// Load all tasks from the backend
-async function loadTasks() {
-  try {
-    const allTasks = await GetAllTasks();
-    tasks.value = allTasks;
-  } catch (error) {
-    outputLog.value += getCurrentTime() + ` 加载任务失败: ${error}\n`;
   }
 }
 
@@ -2842,12 +2874,12 @@ async function saveTaskLogsToDisk() {
 // Add function to load task logs from disk
 async function loadTaskLogsFromDisk() {
   try {
-    // Call backend to load logs
-    const result = await LoadTaskLogs();
-    taskLogs.value = result.logs || {};
-    taskLogsPath.value = result.path;
+    const result = await LoadTaskLogs('', 1, logPageSize.value);
+    if (result && result.logs) {
+      taskLogs.value = result.logs;
+    }
   } catch (error) {
-    console.error('Error loading task logs:', error);
+    console.error('加载任务日志失败:', error);
   }
 }
 
@@ -2960,6 +2992,55 @@ async function pathExists(path: string) {
   // In a real implementation, this would check if a path exists
   return false;
 }
+
+// 加载任务日志
+const loadTaskLogs = async (taskId: string, page: number = currentLogPage.value, size: number = logPageSize.value) => {
+  try {
+    const result = await LoadTaskLogs(taskId, page, size);
+    if (result && result.logs) {
+      taskLogs.value = result.logs;
+      totalLogs.value = await GetTotalLogs(taskId);
+    }
+  } catch (error) {
+    console.error('加载任务日志失败:', error);
+  }
+};
+
+// 监听日志分页变化
+watch([currentLogPage, logPageSize], () => {
+  if (currentTaskLogId.value) {
+    loadTaskLogs(currentTaskLogId.value, currentLogPage.value, logPageSize.value);
+  }
+});
+
+// 在任务选择变化时加载日志
+watch(selectedTaskId, (newTaskId) => {
+  if (newTaskId) {
+    currentLogPage.value = 1;
+    loadTaskLogs(newTaskId);
+  }
+});
+
+// 更新所有 loadTasks 调用
+const handleTaskSave = async () => {
+  // ... existing code ...
+  await loadTasks(1, pageSize.value);
+};
+
+const handleTaskDelete = async () => {
+  // ... existing code ...
+  await loadTasks(1, pageSize.value);
+};
+
+const handleTaskImport = async () => {
+  // ... existing code ...
+  await loadTasks(1, pageSize.value);
+};
+
+const handleTaskExport = async () => {
+  // ... existing code ...
+  await loadTasks(1, pageSize.value);
+};
 </script>
 
 <style>

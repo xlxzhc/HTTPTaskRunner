@@ -9,1219 +9,2483 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// Task represents a scheduled HTTP request task
-type Task struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	URL            string   `json:"url"`
-	Method         string   `json:"method"`
-	Cookie         string   `json:"cookie"`
-	Headers        string   `json:"headers"`
-	Data           string   `json:"data"`
-	UseVirtualIP   bool     `json:"useVirtualIP"`
-	Times          int      `json:"times"`
-	Threads        int      `json:"threads"`
-	ScheduledTime  string   `json:"scheduledTime"`
-	CronExpression string   `json:"cronExpression"`
-	DelayMin       int      `json:"delayMin"`
-	DelayMax       int      `json:"delayMax"`
-	Tags           []string `json:"tags"`
-	CreatedAt      string   `json:"createdAt"`
-	UpdatedAt      string   `json:"updatedAt"`
-	IsRunning      bool     `json:"isRunning"`
-}
-
-// TaskProgress represents the progress of a running task
-type TaskProgress struct {
-	CurrentRequest int       `json:"currentRequest"`
-	TotalRequests  int       `json:"totalRequests"`
-	StartTime      time.Time `json:"startTime"`
-	ElapsedTime    int64     `json:"elapsedTime"` // in milliseconds
-	DelayInfo      []int     `json:"delayInfo"`   // Array of delays used
-}
-
-// TaskLogs represents logs for a task
-type TaskLogs map[string][]string
-
-// TaskLogsResult represents the result of loading task logs
-type TaskLogsResult struct {
-	Logs TaskLogs `json:"logs"`
-	Path string   `json:"path"`
-}
-
-// DeleteLogsResult represents the result of deleting old logs
-type DeleteLogsResult struct {
-	Count int    `json:"count"`
-	Path  string `json:"path"`
-}
-
-// App struct
+// App - 重新设计的应用结构，优化性能
 type App struct {
 	ctx           context.Context
-	Tasks         map[string]*Task
-	RunningTasks  map[string]context.CancelFunc
-	TaskProgress  map[string]*TaskProgress
-	TaskLogs      TaskLogs
+	runningTasks  map[string]*TaskProgress
+	taskMutex     sync.RWMutex
 	cronScheduler *cron.Cron
 	cronJobs      map[string]cron.EntryID
+	cronMutex     sync.RWMutex
+	// 添加缓存机制
+	tasksCache    map[string]*Task
+	cacheMutex    sync.RWMutex
+	lastCacheTime time.Time
+	// 日志管理
+	taskLogs      map[string][]TaskLogEntry // 任务级别日志
+	executionLogs map[string]ExecutionLog   // 执行详细日志
+	logMutex      sync.RWMutex              // 日志锁
+	// 环境变量管理
+	envVariables map[string]EnvVariableData // 环境变量存储（支持分隔符）
+	envMutex     sync.RWMutex               // 环境变量锁
+}
+
+// SuccessCondition - 成功条件配置
+type SuccessCondition struct {
+	Enabled       bool   `json:"enabled"`
+	JsonPath      string `json:"jsonPath"` // JSON路径（用于JSON路径判断）
+	Operator      string `json:"operator"` // equals, not_equals, contains, not_contains, response_contains, response_not_contains, response_equals, response_not_equals
+	ExpectedValue string `json:"expectedValue"`
+}
+
+// EnvVariableData - 环境变量数据结构（支持分隔符）
+type EnvVariableData struct {
+	Value     string `json:"value"`
+	Separator string `json:"separator"`
+}
+
+// Task - 简化的任务结构，优化内存使用
+type Task struct {
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	URL              string            `json:"url"`
+	Method           string            `json:"method"`
+	Headers          map[string]string `json:"headers"`     // 使用map，更高效
+	HeadersText      string            `json:"headersText"` // 用于前端显示和编辑
+	Data             string            `json:"data"`
+	Times            int               `json:"times"`
+	Threads          int               `json:"threads"`
+	DelayMin         int               `json:"delayMin"`
+	DelayMax         int               `json:"delayMax"`
+	Tags             []string          `json:"tags"`
+	CronExpr         string            `json:"cronExpr"`
+	SuccessCondition SuccessCondition  `json:"successCondition"` // 成功条件配置
+	CreatedAt        int64             `json:"createdAt"`        // 时间戳，更高效
+	UpdatedAt        int64             `json:"updatedAt"`
+	IsRunning        bool              `json:"isRunning"`
+	LastRunTime      string            `json:"lastRunTime"`   // 最后执行时间
+	LastRunStatus    string            `json:"lastRunStatus"` // 最后执行状态: success, failed, running
+	LastRunResult    string            `json:"lastRunResult"` // 最后执行结果描述
+}
+
+// TaskProgress - 简化的进度结构
+type TaskProgress struct {
+	Current   int   `json:"current"`
+	Total     int   `json:"total"`
+	StartTime int64 `json:"startTime"`
+	IsRunning bool  `json:"isRunning"`
+}
+
+// TaskList - 任务列表响应
+type TaskList struct {
+	Tasks map[string]*Task `json:"tasks"`
+	Total int              `json:"total"`
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	cronScheduler := cron.New(cron.WithSeconds())
-	cronScheduler.Start()
-
 	return &App{
-		Tasks:         make(map[string]*Task),
-		RunningTasks:  make(map[string]context.CancelFunc),
-		TaskProgress:  make(map[string]*TaskProgress),
-		TaskLogs:      make(TaskLogs),
-		cronScheduler: cronScheduler,
+		runningTasks:  make(map[string]*TaskProgress),
 		cronJobs:      make(map[string]cron.EntryID),
+		tasksCache:    make(map[string]*Task),
+		taskLogs:      make(map[string][]TaskLogEntry),
+		executionLogs: make(map[string]ExecutionLog),
+		envVariables:  make(map[string]EnvVariableData),
+		// 支持秒字段的cron调度器
+		cronScheduler: cron.New(cron.WithSeconds()),
 	}
 }
 
-// startup is called when the app starts. The context is saved
-// so we can call the runtime methods
-func (a *App) startup(ctx context.Context) {
+// OnStartup is called when the app starts up
+func (a *App) OnStartup(ctx context.Context) {
 	a.ctx = ctx
-	a.loadTasksFromDisk()
-	a.loadTaskLogsFromDisk()
-
-	// Restart any tasks with cron expressions
-	for id, task := range a.Tasks {
-		if task.CronExpression != "" {
-			a.scheduleCronTask(id, task.CronExpression)
-		}
-	}
+	a.cronScheduler.Start()
 }
 
-// shutdown is called when the app is closing
-func (a *App) shutdown(ctx context.Context) {
-	if a.cronScheduler != nil {
-		a.cronScheduler.Stop()
-	}
-
-	for taskID, cancelFunc := range a.RunningTasks {
-		cancelFunc()
-		delete(a.RunningTasks, taskID)
-	}
-
-	// Save task logs before shutdown
-	a.saveTaskLogsToDisk()
+// OnDomReady is called after front-end resources have been loaded
+func (a *App) OnDomReady(ctx context.Context) {
+	// 预加载任务数据
+	go a.preloadTasks()
+	// 恢复定时任务状态
+	go a.restoreScheduledTasks()
+	// 加载历史日志数据
+	go a.loadHistoryLogs()
+	// 加载环境变量
+	go a.loadEnvVariables()
 }
 
-// GenerateTaskID generates a unique ID for a task
-func (a *App) GenerateTaskID() string {
-	return fmt.Sprintf("task_%d", time.Now().UnixNano())
+// OnShutdown is called when the app is shutting down
+func (a *App) OnShutdown(ctx context.Context) {
+	a.cronScheduler.Stop()
 }
 
-// SendRequest sends an HTTP request to the specified URL
-func (a *App) SendRequest(url string, method string, ck string, data string, headers string, useVirtualIP bool) string {
-	if url == "" {
-		return "URL cannot be empty"
-	}
+// preloadTasks 预加载任务数据到缓存
+func (a *App) preloadTasks() {
+	a.cacheMutex.Lock()
+	defer a.cacheMutex.Unlock()
 
-	// Create a client with timeout
-	client := &http.Client{
-		Timeout: time.Second * 10,
-	}
-
-	// Create request
-	req, err := http.NewRequest(strings.ToUpper(method), url, strings.NewReader(data))
-	if err != nil {
-		return fmt.Sprintf("Error creating request: %s", err.Error())
-	}
-
-	// Add Content-Type header if not present in custom headers
-	if !strings.Contains(strings.ToLower(headers), "content-type:") {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
-
-	// Process and filter headers
-	var filteredHeaderLines []string
-	var hasAcceptEncodingGzip bool
-
-	// Add custom headers
-	if headers != "" {
-		headerLines := strings.Split(headers, "\n")
-		for _, line := range headerLines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			// Check if it's an Accept-Encoding header with gzip
-			if strings.HasPrefix(strings.ToLower(line), "accept-encoding:") &&
-				strings.Contains(strings.ToLower(line), "gzip") {
-				hasAcceptEncodingGzip = true
-				continue // Skip this header
-			}
-
-			// Add the header to filtered list
-			filteredHeaderLines = append(filteredHeaderLines, line)
-
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				value := strings.TrimSpace(parts[1])
-				req.Header.Set(key, value)
-			}
-		}
-	}
-
-	// Update the headers string to exclude the filtered out headers
-	headers = strings.Join(filteredHeaderLines, "\n")
-
-	// Add cookie header if provided
-	if ck != "" {
-		req.Header.Set("Cookie", ck)
-	}
-
-	// Add a random Chinese IP if useVirtualIP is true
-	if useVirtualIP {
-		ip := generateChineseIP()
-		req.Header.Set("X-Forwarded-For", ip)
-		req.Header.Set("Forwarded-For", ip)
-	}
-
-	// Log if we removed an Accept-Encoding header
-	if hasAcceptEncodingGzip {
-		fmt.Printf("Removed Accept-Encoding header containing gzip\n")
-	}
-
-	// Send request
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Sprintf("Error sending request: %s", err.Error())
-	}
-	defer resp.Body.Close()
-
-	// Read response
-	buf := new(strings.Builder)
-	_, err = io.Copy(buf, resp.Body)
-	if err != nil {
-		return fmt.Sprintf("Error reading response: %s", err.Error())
-	}
-
-	// Try to decode JSON Unicode escape sequences
-	responseStr := buf.String()
-	decodedStr := decodeUnicodeJSON(responseStr)
-
-	return decodedStr
+	tasks := a.loadTasksFromDisk()
+	a.tasksCache = tasks
+	a.lastCacheTime = time.Now()
 }
 
-// ExecuteCardPackage executes the card package operation multiple times with multi-threading
-func (a *App) ExecuteCardPackage(url string, method string, ck string, data string, headers string, useVirtualIP bool, times int, threads int, delayMin int, delayMax int) string {
-	// Create a simple progress tracker
-	progress := &TaskProgress{
-		CurrentRequest: 0,
-		TotalRequests:  times,
-		StartTime:      time.Now(),
-		ElapsedTime:    0,
-		DelayInfo:      make([]int, 0, times),
-	}
-
-	// Execute using the context-aware function with a background context
-	return a.ExecuteCardPackageWithContext(
-		context.Background(),
-		url,
-		method,
-		ck,
-		data,
-		headers,
-		useVirtualIP,
-		times,
-		threads,
-		delayMin,
-		delayMax,
-		progress,
-	)
-}
-
-// SaveTask saves a task configuration
-func (a *App) SaveTask(name string, url string, method string, ck string, data string,
-	headers string, useVirtualIP bool, times int, threads int,
-	scheduledTime string, cronExpression string, delayMin int, delayMax int, tags []string) string {
-
-	now := time.Now().Format(time.RFC3339)
-	taskID := a.GenerateTaskID()
-
-	task := &Task{
-		ID:             taskID,
-		Name:           name,
-		URL:            url,
-		Method:         method,
-		Cookie:         ck,
-		Headers:        headers,
-		Data:           data,
-		UseVirtualIP:   useVirtualIP,
-		Times:          times,
-		Threads:        threads,
-		ScheduledTime:  scheduledTime,
-		CronExpression: cronExpression,
-		DelayMin:       delayMin,
-		DelayMax:       delayMax,
-		Tags:           tags,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		IsRunning:      false,
-	}
-
-	a.Tasks[taskID] = task
-
-	// If a cron expression is provided, schedule the task
-	if cronExpression != "" {
-		err := a.scheduleCronTask(taskID, cronExpression)
-		if err != nil {
-			return fmt.Sprintf("Task saved with ID: %s, but cron scheduling failed: %s", taskID, err.Error())
-		}
-	}
-
-	// Save tasks to disk
-	err := a.saveTasksToDisk()
-	if err != nil {
-		return fmt.Sprintf("Error saving task: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Task saved successfully with ID: %s", taskID)
-}
-
-// GetAllTasks returns all saved tasks
-func (a *App) GetAllTasks() map[string]*Task {
-	return a.Tasks
-}
-
-// GetTaskByID returns a specific task by ID
-func (a *App) GetTaskByID(id string) *Task {
-	return a.Tasks[id]
-}
-
-// UpdateTask updates an existing task
-func (a *App) UpdateTask(id string, name string, url string, method string, ck string,
-	data string, headers string, useVirtualIP bool, times int, threads int,
-	scheduledTime string, cronExpression string, delayMin int, delayMax int, tags []string) string {
-
-	task, exists := a.Tasks[id]
-	if !exists {
-		return fmt.Sprintf("Task with ID %s not found", id)
-	}
-
-	// If task is running, we can't update it
-	if task.IsRunning {
-		return fmt.Sprintf("Task %s is currently running and cannot be updated", id)
-	}
-
-	// Update task properties
-	task.Name = name
-	task.URL = url
-	task.Method = method
-	task.Cookie = ck
-	task.Data = data
-	task.Headers = headers
-	task.UseVirtualIP = useVirtualIP
-	task.Times = times
-	task.Threads = threads
-	task.ScheduledTime = scheduledTime
-
-	// Handle cron expression changes
-	if task.CronExpression != cronExpression {
-		// Remove old cron job if it exists
-		if oldJobID, exists := a.cronJobs[id]; exists && task.CronExpression != "" {
-			a.cronScheduler.Remove(oldJobID)
-			delete(a.cronJobs, id)
-		}
-
-		// Set new cron expression
-		task.CronExpression = cronExpression
-
-		// Schedule new cron job if needed
-		if cronExpression != "" {
-			err := a.scheduleCronTask(id, cronExpression)
-			if err != nil {
-				return fmt.Sprintf("Task updated, but cron scheduling failed: %s", err.Error())
-			}
-		}
-	}
-
-	task.DelayMin = delayMin
-	task.DelayMax = delayMax
-	task.Tags = tags
-	task.UpdatedAt = time.Now().Format(time.RFC3339)
-
-	// Save tasks to disk
-	err := a.saveTasksToDisk()
-	if err != nil {
-		return fmt.Sprintf("Error updating task: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Task %s updated successfully", id)
-}
-
-// DeleteTask deletes a task by ID
-func (a *App) DeleteTask(id string) string {
-	task, exists := a.Tasks[id]
-	if !exists {
-		return fmt.Sprintf("Task with ID %s not found", id)
-	}
-
-	// If the task is running, stop it
-	if task.IsRunning {
-		a.StopTask(id)
-	}
-
-	// If the task has a cron job, remove it
-	if jobID, hasCron := a.cronJobs[id]; hasCron {
-		a.cronScheduler.Remove(jobID)
-		delete(a.cronJobs, id)
-	}
-
-	// Remove task from maps
-	delete(a.Tasks, id)
-	delete(a.TaskProgress, id)
-
-	// Save tasks to disk
-	err := a.saveTasksToDisk()
-	if err != nil {
-		return fmt.Sprintf("Error deleting task: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Task %s deleted successfully", id)
-}
-
-// ExportTasks exports all tasks to a JSON file
-func (a *App) ExportTasks(filepath string) string {
-	tasksJSON, err := json.MarshalIndent(a.Tasks, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("Error exporting tasks: %s", err.Error())
-	}
-
-	err = os.WriteFile(filepath, tasksJSON, 0644)
-	if err != nil {
-		return fmt.Sprintf("Error writing to file: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Tasks exported successfully to %s", filepath)
-}
-
-// ImportTasks imports tasks from a JSON file
-func (a *App) ImportTasks(filepath string) string {
-	data, err := os.ReadFile(filepath)
-	if err != nil {
-		return fmt.Sprintf("Error reading file: %s", err.Error())
-	}
-
-	var importedTasks map[string]*Task
-	err = json.Unmarshal(data, &importedTasks)
-	if err != nil {
-		return fmt.Sprintf("Error parsing tasks: %s", err.Error())
-	}
-
-	// Merge imported tasks with existing ones
-	for id, task := range importedTasks {
-		a.Tasks[id] = task
-	}
-
-	// Save the updated tasks to disk
-	err = a.saveTasksToDisk()
-	if err != nil {
-		return fmt.Sprintf("Error saving imported tasks: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Imported %d tasks successfully", len(importedTasks))
-}
-
-// GetTasksPath returns the path to the tasks data file
+// getTasksPath 获取任务文件路径
 func (a *App) getTasksPath() string {
-	// Store tasks in the user's home directory
-	homeDir, err := os.UserHomeDir()
+	exePath, err := os.Executable()
 	if err != nil {
-		homeDir = "."
+		return "tasks.json"
 	}
 
-	// Create the data directory if it doesn't exist
-	dataDir := filepath.Join(homeDir, ".myui")
+	exeDir := filepath.Dir(exePath)
+	dataDir := filepath.Join(exeDir, "data")
 	os.MkdirAll(dataDir, 0755)
 
 	return filepath.Join(dataDir, "tasks.json")
 }
 
-// saveTasksToDisk saves all tasks to a file
-func (a *App) saveTasksToDisk() error {
-	tasksPath := a.getTasksPath()
-	tasksJSON, err := json.MarshalIndent(a.Tasks, "", "  ")
+// loadTasksFromDisk 从磁盘加载任务
+func (a *App) loadTasksFromDisk() map[string]*Task {
+	tasks := make(map[string]*Task)
+
+	data, err := os.ReadFile(a.getTasksPath())
+	if err != nil {
+		return tasks
+	}
+
+	json.Unmarshal(data, &tasks)
+	return tasks
+}
+
+// saveTasksToDisk 保存任务到磁盘
+func (a *App) saveTasksToDisk(tasks map[string]*Task) error {
+	data, err := json.MarshalIndent(tasks, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(tasksPath, tasksJSON, 0644)
+	return os.WriteFile(a.getTasksPath(), data, 0644)
 }
 
-// loadTasksFromDisk loads all tasks from a file
-func (a *App) loadTasksFromDisk() {
-	tasksPath := a.getTasksPath()
+// GetTasks 获取任务列表（带分页）
+func (a *App) GetTasks(page, pageSize int) *TaskList {
+	a.cacheMutex.RLock()
 
-	// If the file doesn't exist, just return (no tasks saved yet)
-	if _, err := os.Stat(tasksPath); os.IsNotExist(err) {
-		return
+	// 检查缓存是否需要更新
+	if time.Since(a.lastCacheTime) > 5*time.Second {
+		a.cacheMutex.RUnlock()
+		a.preloadTasks()
+		a.cacheMutex.RLock()
 	}
 
-	data, err := os.ReadFile(tasksPath)
-	if err != nil {
-		fmt.Printf("Error loading tasks: %s\n", err.Error())
-		return
+	tasks := make(map[string]*Task)
+	total := len(a.tasksCache)
+
+	// 简单分页逻辑
+	start := (page - 1) * pageSize
+	end := start + pageSize
+
+	i := 0
+	for id, task := range a.tasksCache {
+		if i >= start && i < end {
+			tasks[id] = task
+		}
+		i++
+		if i >= end {
+			break
+		}
 	}
 
-	err = json.Unmarshal(data, &a.Tasks)
-	if err != nil {
-		fmt.Printf("Error parsing tasks: %s\n", err.Error())
-		return
+	a.cacheMutex.RUnlock()
+
+	return &TaskList{
+		Tasks: tasks,
+		Total: total,
 	}
 }
 
-// decodeUnicodeJSON attempts to decode Unicode escape sequences in JSON strings
-func decodeUnicodeJSON(input string) string {
-	// Check if it looks like JSON
-	if !strings.HasPrefix(strings.TrimSpace(input), "{") && !strings.HasPrefix(strings.TrimSpace(input), "[") {
-		return input
-	}
-
-	// Try to decode as raw JSON first to handle Unicode escapes
-	var result interface{}
-	err := json.Unmarshal([]byte(input), &result)
-	if err != nil {
-		// If we can't parse it as JSON, return the original string
-		return input
-	}
-
-	// Re-encode with indentation for better readability
-	prettyJSON, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return input
-	}
-
-	return string(prettyJSON)
+// GetTaskCount 获取任务总数
+func (a *App) GetTaskCount() int {
+	a.cacheMutex.RLock()
+	defer a.cacheMutex.RUnlock()
+	return len(a.tasksCache)
 }
 
-// Chinese IP ranges
-var chineseIPRanges = []struct {
-	start string
-	end   string
-}{
-	{"1.0.1.0", "1.0.3.255"},         // China
-	{"1.1.0.0", "1.1.255.255"},       // China
-	{"1.2.0.0", "1.2.255.255"},       // China
-	{"1.4.1.0", "1.4.127.255"},       // China
-	{"1.8.0.0", "1.8.255.255"},       // China
-	{"1.12.0.0", "1.15.255.255"},     // China
-	{"1.24.0.0", "1.31.255.255"},     // China
-	{"14.0.0.0", "14.0.7.855"},       // China
-	{"14.1.0.0", "14.127.255.255"},   // China
-	{"27.0.0.0", "27.127.255.255"},   // China
-	{"36.0.0.0", "36.255.255.255"},   // China
-	{"39.0.0.0", "39.255.255.255"},   // China
-	{"42.0.0.0", "42.255.255.255"},   // China
-	{"49.0.0.0", "49.255.255.255"},   // China
-	{"58.0.0.0", "58.255.255.255"},   // China
-	{"59.0.0.0", "59.255.255.255"},   // China
-	{"60.0.0.0", "60.255.255.255"},   // China
-	{"61.0.0.0", "61.255.255.255"},   // China
-	{"101.0.0.0", "101.255.255.255"}, // China
-	{"103.0.0.0", "103.255.255.255"}, // China
-	{"106.0.0.0", "106.255.255.255"}, // China
-	{"110.0.0.0", "110.255.255.255"}, // China
-	{"111.0.0.0", "111.255.255.255"}, // China
-	{"112.0.0.0", "112.255.255.255"}, // China
-	{"113.0.0.0", "113.255.255.255"}, // China
-	{"114.0.0.0", "114.255.255.255"}, // China
-	{"115.0.0.0", "115.255.255.255"}, // China
-	{"116.0.0.0", "116.255.255.255"}, // China
-	{"117.0.0.0", "117.255.255.255"}, // China
-	{"118.0.0.0", "118.255.255.255"}, // China
-	{"119.0.0.0", "119.255.255.255"}, // China
-	{"120.0.0.0", "120.255.255.255"}, // China
-	{"121.0.0.0", "121.255.255.255"}, // China
-	{"122.0.0.0", "122.255.255.255"}, // China
-	{"123.0.0.0", "123.255.255.255"}, // China
-	{"124.0.0.0", "124.255.255.255"}, // China
-	{"125.0.0.0", "125.255.255.255"}, // China
-	{"175.0.0.0", "175.255.255.255"}, // China
-	{"180.0.0.0", "180.255.255.255"}, // China
-	{"182.0.0.0", "182.255.255.255"}, // China
-	{"183.0.0.0", "183.255.255.255"}, // China
-	{"202.0.0.0", "202.255.255.255"}, // China
-	{"203.0.0.0", "203.255.255.255"}, // China
-	{"210.0.0.0", "210.255.255.255"}, // China
-	{"211.0.0.0", "211.255.255.255"}, // China
-	{"218.0.0.0", "218.255.255.255"}, // China
-	{"220.0.0.0", "220.255.255.255"}, // China
-	{"221.0.0.0", "221.255.255.255"}, // China
-	{"222.0.0.0", "222.255.255.255"}, // China
-	{"223.0.0.0", "223.255.255.255"}, // China
-}
-
-// Helper function to generate a random Chinese IP address
-func generateChineseIP() string {
-	rand.Seed(time.Now().UnixNano())
-
-	// Select a random Chinese IP range
-	ipRange := chineseIPRanges[rand.Intn(len(chineseIPRanges))]
-
-	// Parse start and end IP
-	startParts := strings.Split(ipRange.start, ".")
-	endParts := strings.Split(ipRange.end, ".")
-
-	// Convert to integers
-	var startIP [4]int
-	var endIP [4]int
-	for i := 0; i < 4; i++ {
-		fmt.Sscanf(startParts[i], "%d", &startIP[i])
-		fmt.Sscanf(endParts[i], "%d", &endIP[i])
+// SaveTask 保存任务
+func (a *App) SaveTask(name, url, method, headersText, data string, times, threads, delayMin, delayMax int, tags []string, cronExpr string, successCondition SuccessCondition) string {
+	if name == "" || url == "" {
+		return "错误：任务名称和URL不能为空"
 	}
 
-	// Generate random IP within range
-	var ip [4]int
-	for i := 0; i < 4; i++ {
-		if startIP[i] == endIP[i] {
-			ip[i] = startIP[i]
+	// 生成任务ID
+	taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
+
+	// 解析headers文本
+	headers := a.parseHeadersText(headersText)
+
+	task := &Task{
+		ID:               taskID,
+		Name:             name,
+		URL:              url,
+		Method:           method,
+		Headers:          headers,
+		HeadersText:      headersText,
+		Data:             data,
+		Times:            times,
+		Threads:          threads,
+		DelayMin:         delayMin,
+		DelayMax:         delayMax,
+		Tags:             tags,
+		CronExpr:         cronExpr,
+		SuccessCondition: successCondition,
+		CreatedAt:        time.Now().Unix(),
+		UpdatedAt:        time.Now().Unix(),
+		IsRunning:        false,
+	}
+
+	// 更新缓存和磁盘
+	a.cacheMutex.Lock()
+	a.tasksCache[taskID] = task
+	tasks := make(map[string]*Task)
+	for k, v := range a.tasksCache {
+		tasks[k] = v
+	}
+	a.cacheMutex.Unlock()
+
+	if err := a.saveTasksToDisk(tasks); err != nil {
+		return fmt.Sprintf("保存失败：%v", err)
+	}
+
+	return fmt.Sprintf("任务 '%s' 保存成功", name)
+}
+
+// UpdateTask 更新任务
+func (a *App) UpdateTask(taskID, name, url, method, headersText, data string, times, threads, delayMin, delayMax int, tags []string, cronExpr string, successCondition SuccessCondition) string {
+	a.cacheMutex.Lock()
+	defer a.cacheMutex.Unlock()
+
+	task, exists := a.tasksCache[taskID]
+	if !exists {
+		return "错误：任务不存在"
+	}
+
+	// 更新任务信息
+	task.Name = name
+	task.URL = url
+	task.Method = method
+	task.Headers = a.parseHeadersText(headersText)
+	task.HeadersText = headersText
+	task.Data = data
+	task.Times = times
+	task.Threads = threads
+	task.DelayMin = delayMin
+	task.DelayMax = delayMax
+	task.Tags = tags
+	task.CronExpr = cronExpr
+	task.SuccessCondition = successCondition
+	task.UpdatedAt = time.Now().Unix()
+
+	// 保存到磁盘
+	tasks := make(map[string]*Task)
+	for k, v := range a.tasksCache {
+		tasks[k] = v
+	}
+
+	if err := a.saveTasksToDisk(tasks); err != nil {
+		return fmt.Sprintf("更新失败：%v", err)
+	}
+
+	return fmt.Sprintf("任务 '%s' 更新成功", name)
+}
+
+// DeleteTask 删除任务
+func (a *App) DeleteTask(taskID string) string {
+	a.cacheMutex.Lock()
+	defer a.cacheMutex.Unlock()
+
+	task, exists := a.tasksCache[taskID]
+	if !exists {
+		return "错误：任务不存在"
+	}
+
+	name := task.Name
+	delete(a.tasksCache, taskID)
+
+	// 保存到磁盘
+	tasks := make(map[string]*Task)
+	for k, v := range a.tasksCache {
+		tasks[k] = v
+	}
+
+	if err := a.saveTasksToDisk(tasks); err != nil {
+		return fmt.Sprintf("删除失败：%v", err)
+	}
+
+	return fmt.Sprintf("任务 '%s' 删除成功", name)
+}
+
+// ExecuteTask 执行任务
+func (a *App) ExecuteTask(taskID string) string {
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
+	if !exists {
+		return "错误：任务不存在"
+	}
+
+	// 检查是否已在运行
+	a.taskMutex.RLock()
+	if _, running := a.runningTasks[taskID]; running {
+		a.taskMutex.RUnlock()
+		return "错误：任务正在运行中"
+	}
+	a.taskMutex.RUnlock()
+
+	// 启动任务
+	go a.runTask(task)
+
+	return fmt.Sprintf("任务 '%s' 开始执行", task.Name)
+}
+
+// runTask 运行任务的核心逻辑
+func (a *App) runTask(task *Task) {
+	// 创建支持分隔符的任务副本列表
+	tasksWithVars := a.createTasksWithSeparatedVariables(task)
+	totalTasks := len(tasksWithVars)
+	totalTimes := task.Times * totalTasks
+	// 设置运行状态
+	progress := &TaskProgress{
+		Current:   0,
+		Total:     totalTimes,
+		StartTime: time.Now().Unix(),
+		IsRunning: true,
+	}
+
+	a.taskMutex.Lock()
+	a.runningTasks[task.ID] = progress
+	a.taskMutex.Unlock()
+
+	// 更新任务状态
+	a.cacheMutex.Lock()
+	a.tasksCache[task.ID].IsRunning = true
+	a.cacheMutex.Unlock()
+
+	// 创建详细日志收集器
+	var detailedLogs []DetailedLogEntry
+	detailLogsChan := make(chan DetailedLogEntry, totalTimes)
+
+	// 创建工作通道
+	jobs := make(chan *Task, totalTimes)
+	results := make(chan bool, totalTimes)
+
+	// 启动工作协程
+	for w := 0; w < task.Threads; w++ {
+		go a.workerWithDetailedLogForTask(jobs, results, detailLogsChan)
+	}
+
+	// 发送任务（每个任务副本执行指定次数）
+	for _, taskVar := range tasksWithVars {
+		for i := 0; i < task.Times; i++ {
+			jobs <- taskVar
+		}
+	}
+	close(jobs)
+
+	// 等待完成并收集详细日志
+	completed := 0
+	successCount := 0
+	for completed < totalTimes {
+		success := <-results
+		if success {
+			successCount++
+		}
+		completed++
+
+		// 收集详细日志
+		select {
+		case detailLog := <-detailLogsChan:
+			detailedLogs = append(detailedLogs, detailLog)
+		default:
+		}
+
+		// 更新进度
+		a.taskMutex.Lock()
+		if prog, exists := a.runningTasks[task.ID]; exists {
+			prog.Current = completed
+		}
+		a.taskMutex.Unlock()
+	}
+
+	// 收集剩余的详细日志
+	close(detailLogsChan)
+	for detailLog := range detailLogsChan {
+		detailedLogs = append(detailedLogs, detailLog)
+	}
+
+	// 记录任务完成（只记录关键结果）
+	duration := time.Now().Unix() - progress.StartTime
+	status := "success"
+	if successCount == 0 {
+		status = "failed"
+	} else if successCount < totalTimes {
+		status = "partial"
+	}
+
+	var message string
+	if totalTasks > 1 {
+		message = fmt.Sprintf("任务 '%s' 执行完成，耗时: %d秒，成功: %d/%d（分隔符产生%d个变体，每个执行%d次）",
+			task.Name, duration, successCount, totalTimes, totalTasks, task.Times)
+	} else {
+		message = fmt.Sprintf("任务 '%s' 执行完成，耗时: %d秒，成功: %d/%d", task.Name, duration, successCount, totalTimes)
+	}
+	logID := a.writeTaskLog(task.ID, message, "execution", status)
+
+	// 保存详细日志
+	summary := fmt.Sprintf("执行完成，成功率: %.1f%%", float64(successCount)/float64(totalTimes)*100)
+	a.writeExecutionLog(logID, detailedLogs, summary, totalTimes, successCount, totalTimes-successCount, duration)
+
+	// 清理
+	a.taskMutex.Lock()
+	delete(a.runningTasks, task.ID)
+	a.taskMutex.Unlock()
+
+	a.cacheMutex.Lock()
+	a.tasksCache[task.ID].IsRunning = false
+	a.cacheMutex.Unlock()
+}
+
+// runTaskWithResult 运行任务并返回结果（用于定时任务）
+func (a *App) runTaskWithResult(task *Task) (bool, int, string) {
+	// 创建替换了环境变量的任务副本
+	taskWithVars := a.createTaskWithVariables(task)
+	// 设置运行状态
+	progress := &TaskProgress{
+		Current:   0,
+		Total:     task.Times,
+		StartTime: time.Now().Unix(),
+		IsRunning: true,
+	}
+
+	a.taskMutex.Lock()
+	a.runningTasks[task.ID] = progress
+	a.taskMutex.Unlock()
+
+	// 更新任务状态
+	a.cacheMutex.Lock()
+	a.tasksCache[task.ID].IsRunning = true
+	a.cacheMutex.Unlock()
+
+	// 创建详细日志收集器
+	var detailedLogs []DetailedLogEntry
+	detailLogsChan := make(chan DetailedLogEntry, task.Times)
+
+	// 创建工作通道
+	jobs := make(chan int, task.Times)
+	results := make(chan bool, task.Times)
+
+	// 启动工作协程
+	for w := 0; w < task.Threads; w++ {
+		go a.workerWithDetailedLog(taskWithVars, jobs, results, detailLogsChan)
+	}
+
+	// 发送任务
+	for i := 0; i < task.Times; i++ {
+		jobs <- i + 1
+	}
+	close(jobs)
+
+	// 等待完成并收集详细日志
+	completed := 0
+	successCount := 0
+	for completed < task.Times {
+		success := <-results
+		if success {
+			successCount++
+		}
+		completed++
+
+		// 收集详细日志
+		select {
+		case detailLog := <-detailLogsChan:
+			detailedLogs = append(detailedLogs, detailLog)
+		default:
+		}
+
+		// 更新进度
+		a.taskMutex.Lock()
+		if prog, exists := a.runningTasks[task.ID]; exists {
+			prog.Current = completed
+		}
+		a.taskMutex.Unlock()
+	}
+
+	// 收集剩余的详细日志
+	close(detailLogsChan)
+	for detailLog := range detailLogsChan {
+		detailedLogs = append(detailedLogs, detailLog)
+	}
+
+	// 记录任务完成（只记录关键结果）
+	duration := time.Now().Unix() - progress.StartTime
+	status := "success"
+	if successCount == 0 {
+		status = "failed"
+	} else if successCount < task.Times {
+		status = "partial"
+	}
+
+	message := fmt.Sprintf("定时任务 '%s' 执行完成，耗时: %d秒，成功: %d/%d", task.Name, duration, successCount, task.Times)
+	logID := a.writeTaskLog(task.ID, message, "execution", status)
+
+	// 保存详细日志
+	summary := fmt.Sprintf("定时执行完成，成功率: %.1f%%", float64(successCount)/float64(task.Times)*100)
+	a.writeExecutionLog(logID, detailedLogs, summary, task.Times, successCount, task.Times-successCount, duration)
+
+	// 清理
+	a.taskMutex.Lock()
+	delete(a.runningTasks, task.ID)
+	a.taskMutex.Unlock()
+
+	a.cacheMutex.Lock()
+	a.tasksCache[task.ID].IsRunning = false
+	a.cacheMutex.Unlock()
+
+	// 返回结果
+	if successCount > 0 {
+		return true, successCount, fmt.Sprintf("成功%d次，失败%d次", successCount, task.Times-successCount)
+	} else {
+		return false, 0, fmt.Sprintf("全部失败，共%d次请求", task.Times)
+	}
+}
+
+// worker 工作协程
+func (a *App) worker(task *Task, jobs <-chan int, results chan<- bool) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	for range jobs {
+		success := a.makeRequest(client, task)
+		results <- success
+
+		// 随机延迟
+		if task.DelayMax > task.DelayMin {
+			delay := task.DelayMin + rand.Intn(task.DelayMax-task.DelayMin)
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
+	}
+}
+
+// workerWithDetailedLog 带详细日志的工作协程
+func (a *App) workerWithDetailedLog(task *Task, jobs <-chan int, results chan<- bool, detailLogs chan<- DetailedLogEntry) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	for range jobs {
+		success, detailLog := a.makeRequestWithDetailedLog(client, task)
+		results <- success
+		detailLogs <- detailLog
+
+		// 随机延迟
+		if task.DelayMax > task.DelayMin {
+			delay := task.DelayMin + rand.Intn(task.DelayMax-task.DelayMin)
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
+	}
+}
+
+// workerWithDetailedLogForTask 支持分隔符的带详细日志工作协程
+func (a *App) workerWithDetailedLogForTask(jobs <-chan *Task, results chan<- bool, detailLogs chan<- DetailedLogEntry) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	for task := range jobs {
+		success, detailLog := a.makeRequestWithDetailedLog(client, task)
+		results <- success
+		detailLogs <- detailLog
+
+		// 随机延迟
+		if task.DelayMax > task.DelayMin {
+			delay := task.DelayMin + rand.Intn(task.DelayMax-task.DelayMin)
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
+	}
+}
+
+// makeRequest 发送HTTP请求
+func (a *App) makeRequest(client *http.Client, task *Task) bool {
+	var body io.Reader
+	if task.Data != "" {
+		body = strings.NewReader(task.Data)
+	}
+
+	req, err := http.NewRequest(task.Method, task.URL, body)
+	if err != nil {
+		return false
+	}
+
+	// 设置headers
+	for key, value := range task.Headers {
+		req.Header.Set(key, value)
+	}
+
+	// 智能设置Content-Type（只在用户未设置时才自动设置）
+	if task.Method != "GET" && task.Data != "" {
+		if req.Header.Get("Content-Type") == "" {
+			if strings.Contains(task.Data, "=") && strings.Contains(task.Data, "&") {
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			} else if strings.HasPrefix(strings.TrimSpace(task.Data), "{") {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	// 读取响应体用于成功条件判断
+	responseBody := ""
+	if task.SuccessCondition.Enabled && task.SuccessCondition.JsonPath != "" {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err == nil {
+			responseBody = string(bodyBytes)
+		}
+	}
+
+	// 使用自定义成功条件判断
+	return a.evaluateSuccessCondition(task, resp, responseBody)
+}
+
+// makeRequestWithDetailedLog 发送HTTP请求并记录详细日志
+func (a *App) makeRequestWithDetailedLog(client *http.Client, task *Task) (bool, DetailedLogEntry) {
+	startTime := time.Now()
+	var body io.Reader
+	if task.Data != "" {
+		body = strings.NewReader(task.Data)
+	}
+
+	req, err := http.NewRequest(task.Method, task.URL, body)
+	if err != nil {
+		return false, a.addDetailedLogEntryWithError(task.ID, task.URL, task.Method, 0, 0, "", err.Error(), false, "network", fmt.Sprintf("创建HTTP请求失败: %v", err), nil)
+	}
+
+	// 设置headers
+	for key, value := range task.Headers {
+		req.Header.Set(key, value)
+	}
+
+	// 智能设置Content-Type（只在用户未设置时才自动设置）
+	if task.Method != "GET" && task.Data != "" {
+		if req.Header.Get("Content-Type") == "" {
+			if strings.Contains(task.Data, "=") && strings.Contains(task.Data, "&") {
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			} else if strings.HasPrefix(strings.TrimSpace(task.Data), "{") {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		}
+	}
+
+	resp, err := client.Do(req)
+	responseTime := time.Since(startTime).Milliseconds()
+
+	if err != nil {
+		detailedError := fmt.Sprintf("网络请求失败: %v", err)
+		return false, a.addDetailedLogEntryWithError(task.ID, task.URL, task.Method, 0, responseTime, "", err.Error(), false, "network", detailedError, nil)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应内容（限制大小）
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*10)) // 限制10KB
+	responseStr := ""
+	if err != nil {
+		detailedError := fmt.Sprintf("读取响应内容失败: %v", err)
+		return false, a.addDetailedLogEntryWithError(task.ID, task.URL, task.Method, resp.StatusCode, responseTime, "", err.Error(), false, "parsing", detailedError, nil)
+	}
+	responseStr = string(responseBody)
+
+	// 使用增强的成功条件判断
+	success, successConditionDetails := a.evaluateSuccessConditionWithDetails(task, resp, responseStr)
+
+	var errorMsg, errorType, detailedError string
+	if !success {
+		if successConditionDetails != nil {
+			// 成功条件失败
+			errorType = "condition"
+			errorMsg = "成功条件不满足"
+			detailedError = a.generateConditionFailureDescription(successConditionDetails)
 		} else {
-			ip[i] = startIP[i] + rand.Intn(endIP[i]-startIP[i]+1)
+			// HTTP状态码失败
+			errorType = "http"
+			errorMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			detailedError = a.generateHttpErrorDescription(resp.StatusCode)
 		}
 	}
 
-	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
+	detailLog := a.addDetailedLogEntryWithError(task.ID, task.URL, task.Method, resp.StatusCode, responseTime, responseStr, errorMsg, success, errorType, detailedError, successConditionDetails)
+	return success, detailLog
 }
 
-// scheduleCronTask schedules a task to run on a cron schedule
-func (a *App) scheduleCronTask(taskID string, cronExpr string) error {
-	// If the task is already scheduled, remove the old schedule
-	if jobID, exists := a.cronJobs[taskID]; exists {
-		a.cronScheduler.Remove(jobID)
-		delete(a.cronJobs, taskID)
+// GetTaskProgress 获取任务进度
+func (a *App) GetTaskProgress(taskID string) *TaskProgress {
+	a.taskMutex.RLock()
+	defer a.taskMutex.RUnlock()
+
+	if progress, exists := a.runningTasks[taskID]; exists {
+		return progress
 	}
 
-	// Add the new cron job
-	jobID, err := a.cronScheduler.AddFunc(cronExpr, func() {
-		// Get the task
-		task, exists := a.Tasks[taskID]
-		if !exists {
-			return
-		}
+	return &TaskProgress{
+		Current:   0,
+		Total:     0,
+		StartTime: 0,
+		IsRunning: false,
+	}
+}
 
-		// Execute the task if it's not already running
-		if !task.IsRunning {
-			go a.ExecuteTask(taskID)
-		}
-	})
+// StopTask 停止任务
+func (a *App) StopTask(taskID string) string {
+	a.taskMutex.Lock()
+	defer a.taskMutex.Unlock()
 
+	if _, exists := a.runningTasks[taskID]; !exists {
+		return "错误：任务未在运行"
+	}
+
+	delete(a.runningTasks, taskID)
+
+	a.cacheMutex.Lock()
+	if task, exists := a.tasksCache[taskID]; exists {
+		task.IsRunning = false
+	}
+	a.cacheMutex.Unlock()
+
+	return "任务已停止"
+}
+
+// GetTaskLogs 获取任务执行日志（兼容性方法）
+func (a *App) GetTaskLogs(taskID string) []string {
+	logsPath := a.getTaskLogPath(taskID)
+
+	data, err := os.ReadFile(logsPath)
 	if err != nil {
-		return err
+		return []string{}
 	}
 
-	// Store the job ID
-	a.cronJobs[taskID] = jobID
+	lines := strings.Split(string(data), "\n")
+	// 过滤空行
+	var logs []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			logs = append(logs, line)
+		}
+	}
+
+	return logs
+}
+
+// GetTaskLogEntries 获取任务级别日志条目（按时间倒序）
+func (a *App) GetTaskLogEntries(taskID string) []TaskLogEntry {
+	a.logMutex.RLock()
+	defer a.logMutex.RUnlock()
+
+	if logs, exists := a.taskLogs[taskID]; exists {
+		// 返回副本，避免并发问题
+		result := make([]TaskLogEntry, len(logs))
+		copy(result, logs)
+
+		// 按时间倒序排列（最新的在前面）
+		sort.Slice(result, func(i, j int) bool {
+			timeI, errI := time.Parse("2006-01-02 15:04:05", result[i].Timestamp)
+			timeJ, errJ := time.Parse("2006-01-02 15:04:05", result[j].Timestamp)
+
+			// 如果时间解析失败，按ID倒序（ID包含时间戳）
+			if errI != nil || errJ != nil {
+				return result[i].ID > result[j].ID
+			}
+
+			return timeI.After(timeJ)
+		})
+
+		return result
+	}
+
+	return []TaskLogEntry{}
+}
+
+// GetExecutionLog 获取执行详细日志（按时间倒序）
+func (a *App) GetExecutionLog(taskLogID string) *ExecutionLog {
+	a.logMutex.RLock()
+	defer a.logMutex.RUnlock()
+
+	if log, exists := a.executionLogs[taskLogID]; exists {
+		// 返回副本，避免并发问题
+		result := log
+		result.DetailedLogs = make([]DetailedLogEntry, len(log.DetailedLogs))
+		copy(result.DetailedLogs, log.DetailedLogs)
+
+		// 按时间倒序排列详细日志（最新的在前面）
+		sort.Slice(result.DetailedLogs, func(i, j int) bool {
+			timeI, errI := time.Parse("2006-01-02 15:04:05", result.DetailedLogs[i].Timestamp)
+			timeJ, errJ := time.Parse("2006-01-02 15:04:05", result.DetailedLogs[j].Timestamp)
+
+			// 如果时间解析失败，按RequestID倒序（RequestID包含时间戳）
+			if errI != nil || errJ != nil {
+				return result.DetailedLogs[i].RequestID > result.DetailedLogs[j].RequestID
+			}
+
+			return timeI.After(timeJ)
+		})
+
+		return &result
+	}
+
 	return nil
 }
 
-// ExecuteTask executes a task by ID (update to log responses)
-func (a *App) ExecuteTask(taskID string) string {
-	task, exists := a.Tasks[taskID]
+// getTaskLogPath 获取任务日志文件路径
+func (a *App) getTaskLogPath(taskID string) string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Sprintf("logs/task_%s.log", taskID)
+	}
+
+	exeDir := filepath.Dir(exePath)
+	logsDir := filepath.Join(exeDir, "logs")
+	os.MkdirAll(logsDir, 0755)
+
+	return filepath.Join(logsDir, fmt.Sprintf("task_%s.log", taskID))
+}
+
+// writeTaskLog 写入任务级别日志（简洁版本）
+func (a *App) writeTaskLog(taskID, message, logType, status string) string {
+	a.logMutex.Lock()
+	defer a.logMutex.Unlock()
+
+	// 生成日志条目ID
+	logID := fmt.Sprintf("%s_%d", taskID, time.Now().UnixNano())
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	logEntry := TaskLogEntry{
+		ID:        logID,
+		Timestamp: timestamp,
+		Message:   message,
+		Type:      logType,
+		Status:    status,
+	}
+
+	// 如果是执行类型的日志，设置ExecutionLogId
+	if logType == "execution" {
+		logEntry.ExecutionLogId = logID
+	}
+
+	// 添加到内存中的任务日志
+	if a.taskLogs[taskID] == nil {
+		a.taskLogs[taskID] = make([]TaskLogEntry, 0)
+	}
+	a.taskLogs[taskID] = append(a.taskLogs[taskID], logEntry)
+
+	// 保持最近100条日志
+	if len(a.taskLogs[taskID]) > 100 {
+		a.taskLogs[taskID] = a.taskLogs[taskID][len(a.taskLogs[taskID])-100:]
+	}
+
+	// 同时写入文件（兼容性）
+	logPath := a.getTaskLogPath(taskID)
+	logFileEntry := fmt.Sprintf("[%s] %s\n", timestamp, message)
+
+	// 追加写入日志文件
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return logID
+	}
+	defer file.Close()
+
+	file.WriteString(logFileEntry)
+
+	// 异步保存任务级别日志到JSON文件
+	go a.saveTaskLogs()
+
+	return logID
+}
+
+// writeExecutionLog 写入执行详细日志
+func (a *App) writeExecutionLog(taskLogID string, detailedLogs []DetailedLogEntry, summary string, totalRequests, successCount, failedCount int, duration int64) {
+	a.logMutex.Lock()
+	defer a.logMutex.Unlock()
+
+	executionLog := ExecutionLog{
+		TaskLogID:     taskLogID,
+		DetailedLogs:  detailedLogs,
+		Summary:       summary,
+		TotalRequests: totalRequests,
+		SuccessCount:  successCount,
+		FailedCount:   failedCount,
+		Duration:      duration,
+	}
+
+	a.executionLogs[taskLogID] = executionLog
+
+	// 异步保存详细执行日志到JSON文件
+	go a.saveExecutionLogs()
+}
+
+// addDetailedLogEntry 添加详细日志条目（保持向后兼容）
+func (a *App) addDetailedLogEntry(taskID, url, method string, statusCode int, responseTime int64, response, errorMsg string, success bool) DetailedLogEntry {
+	return a.addDetailedLogEntryWithError(taskID, url, method, statusCode, responseTime, response, errorMsg, success, "", "", nil)
+}
+
+// addDetailedLogEntryWithError 添加带详细错误信息的日志条目
+func (a *App) addDetailedLogEntryWithError(taskID, url, method string, statusCode int, responseTime int64, response, errorMsg string, success bool, errorType, detailedError string, successConditionDetails *SuccessConditionDetails) DetailedLogEntry {
+	requestID := fmt.Sprintf("%s_%d", taskID, time.Now().UnixNano())
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	return DetailedLogEntry{
+		RequestID:               requestID,
+		Timestamp:               timestamp,
+		URL:                     url,
+		Method:                  method,
+		StatusCode:              statusCode,
+		ResponseTime:            responseTime,
+		Response:                response,
+		Error:                   errorMsg,
+		Success:                 success,
+		SuccessConditionDetails: successConditionDetails,
+		ErrorType:               errorType,
+		DetailedError:           detailedError,
+	}
+}
+
+// parseHeadersText 解析headers文本为map
+func (a *App) parseHeadersText(headersText string) map[string]string {
+	headers := make(map[string]string)
+
+	if headersText == "" {
+		return headers
+	}
+
+	lines := strings.Split(headersText, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		colonIndex := strings.Index(line, ":")
+		if colonIndex > 0 {
+			key := strings.TrimSpace(line[:colonIndex])
+			value := strings.TrimSpace(line[colonIndex+1:])
+			if key != "" && value != "" {
+				headers[key] = value
+			}
+		}
+	}
+
+	return headers
+}
+
+// ScheduleTask 添加定时任务
+func (a *App) ScheduleTask(taskID string) string {
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
 	if !exists {
-		return fmt.Sprintf("Task with ID %s not found", taskID)
+		return "错误：任务不存在"
 	}
 
-	if _, running := a.RunningTasks[taskID]; running {
-		return fmt.Sprintf("Task %s is already running", task.Name)
+	if task.CronExpr == "" {
+		return "错误：任务没有设置定时表达式"
 	}
 
-	// Create a cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
+	a.cronMutex.Lock()
+	defer a.cronMutex.Unlock()
 
-	// Store the cancel function
-	a.RunningTasks[taskID] = cancel
-
-	// Mark task as running
-	task.IsRunning = true
-
-	// Create a progress tracker
-	progress := &TaskProgress{
-		CurrentRequest: 0,
-		TotalRequests:  task.Times,
-		StartTime:      time.Now(),
-		ElapsedTime:    0,
-		DelayInfo:      make([]int, 0, task.Times),
+	// 如果已经有定时任务，先移除
+	if entryID, exists := a.cronJobs[taskID]; exists {
+		a.cronScheduler.Remove(entryID)
 	}
 
-	a.TaskProgress[taskID] = progress
+	// 添加新的定时任务
+	entryID, err := a.cronScheduler.AddFunc(task.CronExpr, func() {
+		// 不记录定时任务触发日志，这属于系统级别日志
 
-	// Log task start
-	a.addTaskLog(taskID, fmt.Sprintf("开始执行任务: %s", task.Name))
+		// 更新最后执行时间和状态
+		a.updateLastRunInfo(taskID, "running", "定时任务执行中...")
 
-	// Log cron expression if present
-	if task.CronExpression != "" {
-		a.addTaskLog(taskID, fmt.Sprintf("定时规则: %s", task.CronExpression))
-	}
+		// 执行任务
+		go func() {
+			// 执行任务并获取结果
+			success, completed, errorMsg := a.runTaskWithResult(task)
 
-	// Execute the task in a goroutine
-	go func() {
-		defer func() {
-			// Clean up when done
-			delete(a.RunningTasks, taskID)
-			task.IsRunning = false
-
-			// Add completion log
-			elapsedMs := time.Since(progress.StartTime).Milliseconds()
-			a.addTaskLog(taskID, fmt.Sprintf("任务完成，总耗时: %dms, 总请求数: %d", elapsedMs, progress.CurrentRequest))
-
-			// Save task logs
-			a.saveTaskLogsToDisk()
+			// 更新执行结果
+			if success {
+				a.updateLastRunInfo(taskID, "success", fmt.Sprintf("执行成功，完成%d次请求", completed))
+			} else {
+				a.updateLastRunInfo(taskID, "failed", errorMsg)
+			}
 		}()
+	})
 
-		result := a.ExecuteCardPackageWithContext(
-			ctx,
-			task.URL,
-			task.Method,
-			task.Cookie,
-			task.Data,
-			task.Headers,
-			task.UseVirtualIP,
-			task.Times,
-			task.Threads,
-			task.DelayMin,
-			task.DelayMax,
-			progress,
-		)
+	if err != nil {
+		return fmt.Sprintf("添加定时任务失败: %v", err)
+	}
 
-		// Log the result
-		fmt.Printf("Task %s completed: %s\n", task.Name, result)
-		a.addTaskLog(taskID, fmt.Sprintf("执行结果: %s", truncateString(result, 500)))
-	}()
+	a.cronJobs[taskID] = entryID
+	// 不记录调度添加日志，这属于系统级别日志
 
-	return fmt.Sprintf("Started task: %s", task.Name)
+	// 保存定时任务状态到文件
+	go a.saveScheduledTasks()
+
+	return fmt.Sprintf("任务 '%s' 已添加到定时调度", task.Name)
 }
 
-// StopTask stops a running task
-func (a *App) StopTask(taskID string) string {
-	cancel, exists := a.RunningTasks[taskID]
+// UnscheduleTask 移除定时任务
+func (a *App) UnscheduleTask(taskID string) string {
+	a.cronMutex.Lock()
+	defer a.cronMutex.Unlock()
+
+	entryID, exists := a.cronJobs[taskID]
 	if !exists {
-		return fmt.Sprintf("Task with ID %s is not running", taskID)
+		return "任务没有定时调度"
 	}
 
-	// Cancel the task
-	cancel()
+	a.cronScheduler.Remove(entryID)
+	delete(a.cronJobs, taskID)
 
-	// Mark the task as not running
-	if task, ok := a.Tasks[taskID]; ok {
-		task.IsRunning = false
+	// 保存定时任务状态到文件
+	go a.saveScheduledTasks()
+
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
+	if exists {
+		// 不记录调度移除日志，这属于系统级别日志
+		return fmt.Sprintf("任务 '%s' 已从定时调度中移除", task.Name)
 	}
 
-	// Remove from running tasks
-	delete(a.RunningTasks, taskID)
-
-	return fmt.Sprintf("Task %s stopped", taskID)
+	return "定时任务已移除"
 }
 
-// GetTaskProgress returns the progress of a running task
-func (a *App) GetTaskProgress(taskID string) *TaskProgress {
-	return a.TaskProgress[taskID]
+// GetScheduledTasks 获取所有定时任务
+func (a *App) GetScheduledTasks() []string {
+	a.cronMutex.RLock()
+	defer a.cronMutex.RUnlock()
+
+	var scheduledTasks []string
+	for taskID := range a.cronJobs {
+		scheduledTasks = append(scheduledTasks, taskID)
+	}
+
+	return scheduledTasks
 }
 
-// TestTask tests a task with a single request (update to log response)
+// TaskLogEntry 任务级别日志条目
+type TaskLogEntry struct {
+	ID             string `json:"id"`             // 日志条目唯一ID
+	Timestamp      string `json:"timestamp"`      // 时间戳
+	Message        string `json:"message"`        // 日志消息
+	Type           string `json:"type"`           // 日志类型: execution, schedule, system
+	Status         string `json:"status"`         // 执行状态: success, failed, running
+	ExecutionLogId string `json:"executionLogId"` // 关联的详细执行日志ID
+}
+
+// DetailedLogEntry 详细日志条目
+type DetailedLogEntry struct {
+	RequestID               string                   `json:"requestId"`               // 请求ID
+	Timestamp               string                   `json:"timestamp"`               // 时间戳
+	URL                     string                   `json:"url"`                     // 请求URL
+	Method                  string                   `json:"method"`                  // 请求方法
+	StatusCode              int                      `json:"statusCode"`              // 响应状态码
+	ResponseTime            int64                    `json:"responseTime"`            // 响应时间(毫秒)
+	Response                string                   `json:"response"`                // 响应内容
+	Error                   string                   `json:"error"`                   // 错误信息
+	Success                 bool                     `json:"success"`                 // 基于自定义成功条件的判断结果
+	SuccessConditionDetails *SuccessConditionDetails `json:"successConditionDetails"` // 成功条件评估详情
+	ErrorType               string                   `json:"errorType"`               // 错误类型: network, parsing, condition, http
+	DetailedError           string                   `json:"detailedError"`           // 详细错误描述
+}
+
+// ExecutionLog 执行日志（包含任务级别和详细日志）
+type ExecutionLog struct {
+	TaskLogID     string             `json:"taskLogId"`     // 对应的任务日志ID
+	DetailedLogs  []DetailedLogEntry `json:"detailedLogs"`  // 详细日志列表
+	Summary       string             `json:"summary"`       // 执行摘要
+	TotalRequests int                `json:"totalRequests"` // 总请求数
+	SuccessCount  int                `json:"successCount"`  // 成功数
+	FailedCount   int                `json:"failedCount"`   // 失败数
+	Duration      int64              `json:"duration"`      // 执行时长(秒)
+}
+
+// TaskScheduleInfo 任务调度信息
+type TaskScheduleInfo struct {
+	TaskID          string `json:"taskId"`
+	IsScheduled     bool   `json:"isScheduled"`
+	CronExpr        string `json:"cronExpr"`
+	NextRunTime     string `json:"nextRunTime"`
+	CronDescription string `json:"cronDescription"`
+	Status          string `json:"status"` // idle, scheduled, running, error
+	LastRunTime     string `json:"lastRunTime"`
+	LastRunStatus   string `json:"lastRunStatus"` // success, failed, running
+	LastRunResult   string `json:"lastRunResult"`
+}
+
+// GetTaskScheduleInfo 获取任务调度信息
+func (a *App) GetTaskScheduleInfo(taskID string) TaskScheduleInfo {
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
+	info := TaskScheduleInfo{
+		TaskID:      taskID,
+		IsScheduled: false,
+		Status:      "idle",
+	}
+
+	if !exists {
+		info.Status = "error"
+		return info
+	}
+
+	info.CronExpr = task.CronExpr
+	info.LastRunTime = task.LastRunTime
+	info.LastRunStatus = task.LastRunStatus
+	info.LastRunResult = task.LastRunResult
+
+	// 检查是否正在运行
+	if task.IsRunning {
+		info.Status = "running"
+		return info
+	}
+
+	// 检查是否有定时调度
+	a.cronMutex.RLock()
+	entryID, isScheduled := a.cronJobs[taskID]
+	a.cronMutex.RUnlock()
+
+	if isScheduled && task.CronExpr != "" {
+		info.IsScheduled = true
+		info.Status = "scheduled"
+
+		// 计算下次执行时间
+		nextTime, err := a.getNextRunTime(task.CronExpr)
+		if err != nil {
+			info.Status = "error"
+			info.NextRunTime = "计算失败: " + err.Error()
+		} else {
+			info.NextRunTime = nextTime
+		}
+
+		// 生成人性化描述
+		info.CronDescription = a.describeCronExpr(task.CronExpr)
+
+		// 验证entry是否还存在
+		entry := a.cronScheduler.Entry(entryID)
+		if entry.ID == 0 {
+			info.Status = "error"
+			info.NextRunTime = "调度已失效"
+		}
+	} else if task.CronExpr != "" {
+		info.Status = "idle"
+		info.CronDescription = a.describeCronExpr(task.CronExpr)
+	}
+
+	return info
+}
+
+// updateLastRunInfo 更新任务的最后执行信息
+func (a *App) updateLastRunInfo(taskID, status, result string) {
+	a.cacheMutex.Lock()
+	defer a.cacheMutex.Unlock()
+
+	task, exists := a.tasksCache[taskID]
+	if !exists {
+		return
+	}
+
+	task.LastRunTime = time.Now().Format("2006-01-02 15:04:05")
+	task.LastRunStatus = status
+	task.LastRunResult = result
+
+	// 不记录状态更新日志，这属于系统级别日志
+}
+
+// getNextRunTime 计算下次执行时间
+func (a *App) getNextRunTime(cronExpr string) (string, error) {
+	fields := strings.Fields(cronExpr)
+	var schedule cron.Schedule
+	var err error
+
+	if len(fields) == 6 {
+		// 6字段格式（秒 分 时 日 月 周）- 使用支持秒的解析器
+		parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		schedule, err = parser.Parse(cronExpr)
+	} else if len(fields) == 5 {
+		// 5字段格式（分 时 日 月 周）- 使用标准解析器
+		schedule, err = cron.ParseStandard(cronExpr)
+	} else {
+		return "", fmt.Errorf("Cron表达式格式错误：期望5字段或6字段，实际%d字段", len(fields))
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("解析Cron表达式失败: %v", err)
+	}
+
+	nextTime := schedule.Next(time.Now())
+	return nextTime.Format("2006-01-02 15:04:05"), nil
+}
+
+// describeCronExpr 生成Cron表达式的人性化描述
+func (a *App) describeCronExpr(cronExpr string) string {
+	if cronExpr == "" {
+		return ""
+	}
+
+	fields := strings.Fields(cronExpr)
+
+	var second, minute, hour, day, month, weekday string
+
+	if len(fields) == 6 {
+		// 6字段格式：秒 分 时 日 月 周
+		second, minute, hour, day, month, weekday = fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
+	} else if len(fields) == 5 {
+		// 5字段格式：分 时 日 月 周
+		second = "0"
+		minute, hour, day, month, weekday = fields[0], fields[1], fields[2], fields[3], fields[4]
+	} else {
+		return cronExpr
+	}
+
+	// 简单的描述生成逻辑
+	if minute == "*" && hour == "*" && day == "*" && month == "*" && weekday == "*" {
+		if second == "0" || second == "*" {
+			return "每分钟"
+		}
+		return fmt.Sprintf("每分钟第%s秒", second)
+	}
+
+	if hour == "*" && day == "*" && month == "*" && weekday == "*" {
+		if minute == "0" {
+			return "每小时整点"
+		}
+		if strings.HasPrefix(minute, "*/") {
+			interval := strings.TrimPrefix(minute, "*/")
+			return fmt.Sprintf("每%s分钟", interval)
+		}
+		return fmt.Sprintf("每小时第%s分钟", minute)
+	}
+
+	if day == "*" && month == "*" && weekday == "*" {
+		if minute == "0" && (second == "0" || second == "*") {
+			if strings.HasPrefix(hour, "*/") {
+				interval := strings.TrimPrefix(hour, "*/")
+				return fmt.Sprintf("每%s小时", interval)
+			}
+			return fmt.Sprintf("每天%s点", hour)
+		}
+		if second == "0" || second == "*" {
+			return fmt.Sprintf("每天%s:%s", hour, minute)
+		}
+		return fmt.Sprintf("每天%s:%s:%s", hour, minute, second)
+	}
+
+	if month == "*" && weekday != "*" {
+		weekdayDesc := ""
+		switch weekday {
+		case "1-5":
+			weekdayDesc = "工作日"
+		case "6,0", "0,6":
+			weekdayDesc = "周末"
+		default:
+			weekdayDesc = "每周" + weekday
+		}
+
+		if minute == "0" {
+			return fmt.Sprintf("%s %s点", weekdayDesc, hour)
+		}
+		return fmt.Sprintf("%s %s:%s", weekdayDesc, hour, minute)
+	}
+
+	// 默认返回原表达式
+	return cronExpr
+}
+
+// getScheduledTasksPath 获取定时任务状态文件路径
+func (a *App) getScheduledTasksPath() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "scheduled_tasks.json"
+	}
+
+	exeDir := filepath.Dir(exePath)
+	return filepath.Join(exeDir, "scheduled_tasks.json")
+}
+
+// saveScheduledTasks 保存定时任务状态到文件
+func (a *App) saveScheduledTasks() error {
+	a.cronMutex.RLock()
+	defer a.cronMutex.RUnlock()
+
+	// 只保存任务ID列表，因为cron表达式已经在任务配置中
+	scheduledTaskIDs := make([]string, 0, len(a.cronJobs))
+	for taskID := range a.cronJobs {
+		scheduledTaskIDs = append(scheduledTaskIDs, taskID)
+	}
+
+	data, err := json.MarshalIndent(scheduledTaskIDs, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(a.getScheduledTasksPath(), data, 0644)
+}
+
+// restoreScheduledTasks 从文件恢复定时任务状态
+func (a *App) restoreScheduledTasks() {
+	scheduledPath := a.getScheduledTasksPath()
+
+	// 检查文件是否存在
+	if _, err := os.Stat(scheduledPath); os.IsNotExist(err) {
+		return // 文件不存在，跳过恢复
+	}
+
+	data, err := os.ReadFile(scheduledPath)
+	if err != nil {
+		return // 读取失败，跳过恢复
+	}
+
+	var scheduledTaskIDs []string
+	if err := json.Unmarshal(data, &scheduledTaskIDs); err != nil {
+		return // 解析失败，跳过恢复
+	}
+
+	// 等待任务缓存加载完成
+	time.Sleep(1 * time.Second)
+
+	// 恢复每个定时任务
+	for _, taskID := range scheduledTaskIDs {
+		a.cacheMutex.RLock()
+		task, exists := a.tasksCache[taskID]
+		a.cacheMutex.RUnlock()
+
+		if !exists || task.CronExpr == "" {
+			continue // 任务不存在或没有cron表达式，跳过
+		}
+
+		// 重新添加定时任务
+		a.cronMutex.Lock()
+		entryID, err := a.cronScheduler.AddFunc(task.CronExpr, func() {
+			// 更新最后执行时间和状态
+			a.updateLastRunInfo(taskID, "running", "定时任务执行中...")
+
+			// 执行任务
+			success, _, result := a.runTaskWithResult(task)
+
+			// 更新执行结果
+			status := "success"
+			if !success {
+				status = "failed"
+			}
+			a.updateLastRunInfo(taskID, status, result)
+		})
+
+		if err == nil {
+			a.cronJobs[taskID] = entryID
+		}
+		a.cronMutex.Unlock()
+	}
+}
+
+// TestTask 测试任务（单次请求）
 func (a *App) TestTask(taskID string) string {
-	task, exists := a.Tasks[taskID]
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
 	if !exists {
-		return fmt.Sprintf("Task with ID %s not found", taskID)
+		return "错误：任务不存在"
 	}
 
-	// Log the test start
-	a.addTaskLog(taskID, fmt.Sprintf("测试任务: %s", task.Name))
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 
-	// Send a single request
-	response := a.SendRequest(
-		task.URL,
-		task.Method,
-		task.Cookie,
-		task.Data,
-		task.Headers,
-		task.UseVirtualIP,
-	)
-
-	// Log the response
-	a.addTaskLog(taskID, fmt.Sprintf("测试响应: %s", truncateString(response, 500)))
-
-	// Save task logs
-	a.saveTaskLogsToDisk()
-
-	return response
+	// 发送详细的测试请求
+	result := a.makeDetailedRequest(client, task)
+	return result
 }
 
-// ExecuteCardPackageWithContext executes the card package operation with context (update to log responses)
-func (a *App) ExecuteCardPackageWithContext(
-	ctx context.Context,
-	url string,
-	method string,
-	ck string,
-	data string,
-	headers string,
-	useVirtualIP bool,
-	times int,
-	threads int,
-	delayMin int,
-	delayMax int,
-	progress *TaskProgress,
-) string {
-	if url == "" {
-		return "URL cannot be empty"
+// SuccessConditionDetails 成功条件评估详情
+type SuccessConditionDetails struct {
+	Type          string `json:"type"`          // "json_path" 或 "string_based"
+	JsonPath      string `json:"jsonPath"`      // JSON路径（仅当type为json_path时）
+	Operator      string `json:"operator"`      // 操作符
+	ExpectedValue string `json:"expectedValue"` // 期望值
+	ActualValue   string `json:"actualValue"`   // 实际值
+	Result        bool   `json:"result"`        // 判断结果
+	Reason        string `json:"reason"`        // 详细说明
+}
+
+// TestTaskResult 测试结果结构体
+type TestTaskResult struct {
+	Success                 bool                     `json:"success"`
+	StatusCode              int                      `json:"statusCode"`
+	StatusText              string                   `json:"statusText"`
+	ResponseTime            int64                    `json:"responseTime"`
+	RequestHeaders          map[string]string        `json:"requestHeaders"`
+	ResponseHeaders         map[string]string        `json:"responseHeaders"`
+	ResponseBody            string                   `json:"responseBody"`
+	Error                   string                   `json:"error"`
+	RequestURL              string                   `json:"requestUrl"`
+	RequestMethod           string                   `json:"requestMethod"`
+	RequestBodySize         int                      `json:"requestBodySize"`
+	SensitiveHeaders        []string                 `json:"sensitiveHeaders"`
+	SuccessConditionDetails *SuccessConditionDetails `json:"successConditionDetails"`
+}
+
+// TestTaskWithBackend 使用后端发送HTTP请求（绕过浏览器限制）
+func (a *App) TestTaskWithBackend(taskID string) TestTaskResult {
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
+	if !exists {
+		return TestTaskResult{
+			Success: false,
+			Error:   "错误：任务不存在",
+		}
 	}
 
-	if times <= 0 {
-		return "Times must be greater than 0"
+	// 创建替换了环境变量的任务副本
+	taskWithVars := a.createTaskWithVariables(task)
+	return a.makeDetailedRequestWithResult(taskWithVars)
+}
+
+// TestTaskDataWithBackend 直接使用任务数据测试（不需要保存任务）
+func (a *App) TestTaskDataWithBackend(name, url, method, headersText, data string, successCondition SuccessCondition) TestTaskResult {
+	// 解析headers
+	headers := a.parseHeadersText(headersText)
+
+	task := &Task{
+		Name:             name,
+		URL:              url,
+		Method:           method,
+		Headers:          headers,
+		HeadersText:      headersText,
+		Data:             data,
+		SuccessCondition: successCondition,
 	}
 
-	if threads <= 0 {
-		threads = 1
-	}
+	// 创建替换了环境变量的任务副本
+	taskWithVars := a.createTaskWithVariables(task)
+	return a.makeDetailedRequestWithResult(taskWithVars)
+}
 
-	// Limit threads to a reasonable number
-	if threads > 100 {
-		threads = 100
-	}
-
-	// Create a wait group to wait for all goroutines to finish
-	var wg sync.WaitGroup
-	wg.Add(threads)
-
-	// Create a channel for results
-	resultCh := make(chan string, times)
-
-	// Create a channel for tasks
-	taskCh := make(chan int, times)
-
-	// Fill the task channel with task indices
-	for i := 0; i < times; i++ {
-		taskCh <- i
-	}
-	close(taskCh)
-
-	// Track start time
+// makeDetailedRequestWithResult 发送详细的HTTP请求并返回结构化结果
+func (a *App) makeDetailedRequestWithResult(task *Task) TestTaskResult {
 	startTime := time.Now()
 
-	// Create worker goroutines
-	for i := 0; i < threads; i++ {
-		go func(workerID int) {
-			defer wg.Done()
+	result := TestTaskResult{
+		RequestURL:      task.URL,
+		RequestMethod:   task.Method,
+		RequestBodySize: len(task.Data),
+		RequestHeaders:  make(map[string]string),
+		ResponseHeaders: make(map[string]string),
+	}
 
-			for taskIndex := range taskCh {
-				// Check if context is cancelled
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					// Continue execution
-				}
-
-				// Apply random delay if specified
-				var delay int
-				if delayMax > delayMin && delayMin >= 0 {
-					delay = rand.Intn(delayMax-delayMin+1) + delayMin
-					if delay > 0 {
-						time.Sleep(time.Duration(delay) * time.Millisecond)
-					}
-				}
-
-				// Send request
-				response := a.SendRequest(url, method, ck, data, headers, useVirtualIP)
-
-				// Get task ID from context if available
-				if taskID, ok := ctx.Value("taskID").(string); ok && taskID != "" {
-					// Log the response for the task
-					a.addTaskLog(taskID, fmt.Sprintf("请求 %d 响应: %s", taskIndex+1, truncateString(response, 200)))
-				}
-
-				// Update progress
-				progress.CurrentRequest++
-				if delay > 0 {
-					progress.DelayInfo = append(progress.DelayInfo, delay)
-				}
-				progress.ElapsedTime = time.Since(startTime).Milliseconds()
-
-				// Send result to channel
-				resultCh <- fmt.Sprintf("Request %d: %s", taskIndex+1, response)
+	// 检查敏感headers
+	sensitiveHeaders := []string{}
+	for key, value := range task.Headers {
+		lowerKey := strings.ToLower(key)
+		if strings.Contains(lowerKey, "cookie") ||
+			strings.Contains(lowerKey, "authorization") ||
+			strings.Contains(lowerKey, "token") {
+			sensitiveHeaders = append(sensitiveHeaders, key)
+			// 脱敏处理
+			if len(value) > 20 {
+				result.RequestHeaders[key] = value[:10] + "***" + value[len(value)-7:]
+			} else {
+				result.RequestHeaders[key] = "***"
 			}
-		}(i)
-	}
-
-	// Wait for all goroutines to finish
-	wg.Wait()
-	close(resultCh)
-
-	// Collect results
-	var results []string
-	for result := range resultCh {
-		results = append(results, result)
-	}
-
-	// Calculate elapsed time
-	elapsedTime := time.Since(startTime)
-	elapsedMs := elapsedTime.Milliseconds()
-
-	// Calculate average delay if any delays were applied
-	var avgDelay float64
-	if len(progress.DelayInfo) > 0 {
-		var totalDelay int
-		for _, d := range progress.DelayInfo {
-			totalDelay += d
+		} else {
+			result.RequestHeaders[key] = value
 		}
-		avgDelay = float64(totalDelay) / float64(len(progress.DelayInfo))
+	}
+	result.SensitiveHeaders = sensitiveHeaders
+
+	var body io.Reader
+	if task.Data != "" {
+		body = strings.NewReader(task.Data)
 	}
 
-	// Format summary
-	var summary string
-	if len(progress.DelayInfo) > 0 {
-		summary = fmt.Sprintf("Completed %d requests in %dms (%.2f req/s). Average delay: %.2fms",
-			times, elapsedMs, float64(times)/(float64(elapsedMs)/1000), avgDelay)
+	req, err := http.NewRequest(task.Method, task.URL, body)
+	if err != nil {
+		result.Error = fmt.Sprintf("创建请求失败: %v", err)
+		return result
+	}
+
+	// 设置所有headers（后端没有浏览器限制）
+	for key, value := range task.Headers {
+		req.Header.Set(key, value)
+	}
+
+	// 智能设置Content-Type
+	if task.Method != "GET" && task.Data != "" {
+		if req.Header.Get("Content-Type") == "" {
+			if strings.Contains(task.Data, "=") && strings.Contains(task.Data, "&") {
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			} else if strings.HasPrefix(strings.TrimSpace(task.Data), "{") {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		}
+	}
+
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		// 不跟随重定向，让用户看到原始响应
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		result.Error = fmt.Sprintf("请求失败: %v", err)
+		result.ResponseTime = time.Since(startTime).Milliseconds()
+		return result
+	}
+	defer resp.Body.Close()
+
+	result.StatusCode = resp.StatusCode
+	result.StatusText = resp.Status
+	result.ResponseTime = time.Since(startTime).Milliseconds()
+
+	// 获取响应headers
+	for key, values := range resp.Header {
+		if len(values) > 0 {
+			result.ResponseHeaders[key] = values[0]
+		}
+	}
+
+	// 读取响应内容
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		result.Error = fmt.Sprintf("读取响应失败: %v", err)
+		return result
+	}
+
+	// 限制响应内容长度
+	respContent := string(respBody)
+	if len(respContent) > 5000 {
+		result.ResponseBody = respContent[:5000] + "\n\n... (内容过长，已截断，总长度: " +
+			fmt.Sprintf("%d", len(respContent)) + " 字符)"
 	} else {
-		summary = fmt.Sprintf("Completed %d requests in %dms (%.2f req/s) \n %s",
-			times, elapsedMs, float64(times)/(float64(elapsedMs)/1000), results)
+		result.ResponseBody = respContent
 	}
 
-	return summary
+	// 使用自定义成功条件判断（与正式执行保持一致）
+	success, details := a.evaluateSuccessConditionWithDetails(task, resp, respContent)
+	result.Success = success
+	result.SuccessConditionDetails = details
+
+	return result
 }
 
-// ExportTasksByIDs exports selected tasks to a JSON file
-func (a *App) ExportTasksByIDs(filepath string, taskIDs []string) string {
-	if len(taskIDs) == 0 {
-		return "No tasks selected for export"
+// makeDetailedRequest 保持向后兼容的简单版本
+func (a *App) makeDetailedRequest(client *http.Client, task *Task) string {
+	result := a.makeDetailedRequestWithResult(task)
+
+	if result.Error != "" {
+		return fmt.Sprintf("任务 '%s' 测试失败: %s", task.Name, result.Error)
 	}
 
-	// Create a map with only the selected tasks
-	selectedTasks := make(map[string]*Task)
-	for _, id := range taskIDs {
-		if task, exists := a.Tasks[id]; exists {
-			selectedTasks[id] = task
+	if result.Success {
+		return fmt.Sprintf("任务 '%s' 测试成功\n状态码: %d\n响应时间: %dms\n响应内容: %s",
+			task.Name, result.StatusCode, result.ResponseTime, result.ResponseBody)
+	} else {
+		return fmt.Sprintf("任务 '%s' 测试失败\n状态码: %d\n响应时间: %dms\n响应内容: %s",
+			task.Name, result.StatusCode, result.ResponseTime, result.ResponseBody)
+	}
+}
+
+// getTaskLogsPath 获取任务级别日志文件路径
+func (a *App) getTaskLogsPath() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "task_logs.json"
+	}
+
+	exeDir := filepath.Dir(exePath)
+	return filepath.Join(exeDir, "task_logs.json")
+}
+
+// getExecutionLogsPath 获取详细执行日志文件路径
+func (a *App) getExecutionLogsPath() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "execution_logs.json"
+	}
+
+	exeDir := filepath.Dir(exePath)
+	return filepath.Join(exeDir, "execution_logs.json")
+}
+
+// saveTaskLogs 保存任务级别日志到文件
+func (a *App) saveTaskLogs() error {
+	a.logMutex.RLock()
+	defer a.logMutex.RUnlock()
+
+	data, err := json.MarshalIndent(a.taskLogs, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(a.getTaskLogsPath(), data, 0644)
+}
+
+// saveExecutionLogs 保存详细执行日志到文件
+func (a *App) saveExecutionLogs() error {
+	a.logMutex.RLock()
+	defer a.logMutex.RUnlock()
+
+	data, err := json.MarshalIndent(a.executionLogs, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(a.getExecutionLogsPath(), data, 0644)
+}
+
+// loadHistoryLogs 加载历史日志数据
+func (a *App) loadHistoryLogs() {
+	// 加载任务级别日志
+	taskLogsPath := a.getTaskLogsPath()
+	if data, err := os.ReadFile(taskLogsPath); err == nil {
+		var taskLogs map[string][]TaskLogEntry
+		if err := json.Unmarshal(data, &taskLogs); err == nil {
+			a.logMutex.Lock()
+			a.taskLogs = taskLogs
+			a.logMutex.Unlock()
 		}
 	}
 
-	if len(selectedTasks) == 0 {
-		return "None of the selected task IDs exist"
+	// 加载详细执行日志
+	executionLogsPath := a.getExecutionLogsPath()
+	if data, err := os.ReadFile(executionLogsPath); err == nil {
+		var executionLogs map[string]ExecutionLog
+		if err := json.Unmarshal(data, &executionLogs); err == nil {
+			a.logMutex.Lock()
+			a.executionLogs = executionLogs
+			a.logMutex.Unlock()
+		}
 	}
 
-	// Export the selected tasks
-	tasksJSON, err := json.MarshalIndent(selectedTasks, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("Error exporting tasks: %s", err.Error())
-	}
-
-	err = os.WriteFile(filepath, tasksJSON, 0644)
-	if err != nil {
-		return fmt.Sprintf("Error writing to file: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Exported %d tasks successfully to %s", len(selectedTasks), filepath)
+	// 清理过期日志（保留最近30天）
+	a.cleanupOldLogs()
 }
 
-// ExportTasksByTags exports tasks with the specified tags to a JSON file
-func (a *App) ExportTasksByTags(filepath string, tags []string) string {
-	if len(tags) == 0 {
-		return "No tags specified for filtering"
+// cleanupOldLogs 清理过期日志
+func (a *App) cleanupOldLogs() {
+	a.logMutex.Lock()
+	defer a.logMutex.Unlock()
+
+	cutoffTime := time.Now().AddDate(0, 0, -30) // 30天前
+
+	// 清理任务级别日志
+	for taskID, logs := range a.taskLogs {
+		var filteredLogs []TaskLogEntry
+		for _, log := range logs {
+			if logTime, err := time.Parse("2006-01-02 15:04:05", log.Timestamp); err == nil {
+				if logTime.After(cutoffTime) {
+					filteredLogs = append(filteredLogs, log)
+				}
+			} else {
+				// 如果解析时间失败，保留日志
+				filteredLogs = append(filteredLogs, log)
+			}
+		}
+
+		if len(filteredLogs) == 0 {
+			delete(a.taskLogs, taskID)
+		} else {
+			a.taskLogs[taskID] = filteredLogs
+		}
 	}
 
-	// Create a map with only the tasks that have the specified tags
-	selectedTasks := make(map[string]*Task)
-	for id, task := range a.Tasks {
-		// Check if the task has any of the specified tags
-		for _, taskTag := range task.Tags {
-			for _, filterTag := range tags {
-				if taskTag == filterTag {
-					selectedTasks[id] = task
+	// 清理详细执行日志（基于任务级别日志的存在性）
+	for logID := range a.executionLogs {
+		// 检查对应的任务级别日志是否还存在
+		found := false
+		for _, logs := range a.taskLogs {
+			for _, log := range logs {
+				if log.ID == logID {
+					found = true
 					break
 				}
 			}
-			// If we've already added this task, no need to check more tags
-			if _, added := selectedTasks[id]; added {
+			if found {
 				break
 			}
 		}
-	}
 
-	if len(selectedTasks) == 0 {
-		return "No tasks found with the specified tags"
+		if !found {
+			delete(a.executionLogs, logID)
+		}
 	}
+}
 
-	// Export the selected tasks
-	tasksJSON, err := json.MarshalIndent(selectedTasks, "", "  ")
+// ==================== 环境变量管理 ====================
+
+// getEnvVariablesPath 获取环境变量文件路径
+func (a *App) getEnvVariablesPath() string {
+	exePath, err := os.Executable()
 	if err != nil {
-		return fmt.Sprintf("Error exporting tasks: %s", err.Error())
+		return "env_variables.json"
 	}
 
-	err = os.WriteFile(filepath, tasksJSON, 0644)
-	if err != nil {
-		return fmt.Sprintf("Error writing to file: %s", err.Error())
-	}
-
-	return fmt.Sprintf("Exported %d tasks with the specified tags to %s", len(selectedTasks), filepath)
+	exeDir := filepath.Dir(exePath)
+	return filepath.Join(exeDir, "env_variables.json")
 }
 
-// OpenSaveFileDialog opens a save file dialog
-func (a *App) OpenSaveFileDialog(title string, defaultFilename string, filter string) (string, error) {
-	return wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
-		Title:           title,
-		DefaultFilename: defaultFilename,
-		Filters: []wailsRuntime.FileFilter{
-			{
-				DisplayName: "JSON Files",
-				Pattern:     filter,
-			},
-		},
-	})
-}
-
-// OpenFileDialog opens a file dialog
-func (a *App) OpenFileDialog(title string, filter string) (string, error) {
-	return wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
-		Title: title,
-		Filters: []wailsRuntime.FileFilter{
-			{
-				DisplayName: "JSON Files",
-				Pattern:     filter,
-			},
-		},
-	})
-}
-
-// getLogsPath returns the path to the logs directory
-func (a *App) getLogsPath() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		homeDir = "."
-	}
-
-	return filepath.Join(homeDir, ".myui", "logs")
-}
-
-// EnsureLogDirectory ensures the logs directory exists
-func (a *App) EnsureLogDirectory() error {
-	logsPath := a.getLogsPath()
-	return os.MkdirAll(logsPath, 0755)
-}
-
-// SaveTaskLogs saves task logs to disk
-func (a *App) SaveTaskLogs(logs TaskLogs) *TaskLogsResult {
-	a.TaskLogs = logs
-	err := a.saveTaskLogsToDisk()
-	if err != nil {
-		fmt.Printf("Error saving task logs: %v\n", err)
-	}
-
-	return &TaskLogsResult{
-		Logs: a.TaskLogs,
-		Path: a.getLogsPath(),
+// loadEnvVariables 加载环境变量
+func (a *App) loadEnvVariables() {
+	envPath := a.getEnvVariablesPath()
+	if data, err := os.ReadFile(envPath); err == nil {
+		var envVars map[string]EnvVariableData
+		if err := json.Unmarshal(data, &envVars); err == nil {
+			a.envMutex.Lock()
+			a.envVariables = envVars
+			a.envMutex.Unlock()
+		} else {
+			// 尝试加载旧格式（字符串格式）
+			var oldEnvVars map[string]string
+			if err := json.Unmarshal(data, &oldEnvVars); err == nil {
+				a.envMutex.Lock()
+				a.envVariables = make(map[string]EnvVariableData)
+				for k, v := range oldEnvVars {
+					a.envVariables[k] = EnvVariableData{Value: v, Separator: ""}
+				}
+				a.envMutex.Unlock()
+			}
+		}
 	}
 }
 
-// saveTaskLogsToDisk saves task logs to disk
-func (a *App) saveTaskLogsToDisk() error {
-	logsPath := a.getLogsPath()
+// saveEnvVariables 保存环境变量到文件
+func (a *App) saveEnvVariables() error {
+	a.envMutex.RLock()
+	defer a.envMutex.RUnlock()
 
-	// Create logs directory if it doesn't exist
-	err := os.MkdirAll(logsPath, 0755)
+	data, err := json.MarshalIndent(a.envVariables, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	// Save each task's logs to its own file
-	for taskID, logs := range a.TaskLogs {
-		if len(logs) == 0 {
-			continue
-		}
-
-		taskLogPath := filepath.Join(logsPath, taskID+".log")
-		err := os.WriteFile(taskLogPath, []byte(strings.Join(logs, "\n")), 0644)
-		if err != nil {
-			fmt.Printf("Error saving logs for task %s: %v\n", taskID, err)
-		}
-	}
-
-	return nil
+	return os.WriteFile(a.getEnvVariablesPath(), data, 0644)
 }
 
-// LoadTaskLogs loads task logs from disk
-func (a *App) LoadTaskLogs() *TaskLogsResult {
-	a.loadTaskLogsFromDisk()
+// GetEnvVariables 获取所有环境变量（向后兼容，返回字符串格式）
+func (a *App) GetEnvVariables() map[string]string {
+	a.envMutex.RLock()
+	defer a.envMutex.RUnlock()
 
-	return &TaskLogsResult{
-		Logs: a.TaskLogs,
-		Path: a.getLogsPath(),
+	result := make(map[string]string)
+	for k, v := range a.envVariables {
+		result[k] = v.Value
 	}
+	return result
 }
 
-// loadTaskLogsFromDisk loads task logs from disk
-func (a *App) loadTaskLogsFromDisk() {
-	logsPath := a.getLogsPath()
+// GetEnvVariablesWithSeparator 获取所有环境变量（包含分隔符信息）
+func (a *App) GetEnvVariablesWithSeparator() map[string]EnvVariableData {
+	a.envMutex.RLock()
+	defer a.envMutex.RUnlock()
 
-	// Create logs directory if it doesn't exist
-	err := os.MkdirAll(logsPath, 0755)
-	if err != nil {
-		fmt.Printf("Error creating logs directory: %v\n", err)
-		return
+	result := make(map[string]EnvVariableData)
+	for k, v := range a.envVariables {
+		result[k] = v
 	}
-
-	// List log files
-	files, err := os.ReadDir(logsPath)
-	if err != nil {
-		fmt.Printf("Error reading logs directory: %v\n", err)
-		return
-	}
-
-	// Load each task's logs
-	for _, file := range files {
-		if file.IsDir() || !strings.HasSuffix(file.Name(), ".log") {
-			continue
-		}
-
-		taskID := strings.TrimSuffix(file.Name(), ".log")
-		taskLogPath := filepath.Join(logsPath, file.Name())
-
-		content, err := os.ReadFile(taskLogPath)
-		if err != nil {
-			fmt.Printf("Error reading log file %s: %v\n", taskLogPath, err)
-			continue
-		}
-
-		if len(content) > 0 {
-			a.TaskLogs[taskID] = strings.Split(string(content), "\n")
-		}
-	}
+	return result
 }
 
-// ClearTaskLogs clears logs for a task or all tasks
-func (a *App) ClearTaskLogs(taskID string) error {
-	logsPath := a.getLogsPath()
+// SetEnvVariable 设置环境变量（向后兼容）
+func (a *App) SetEnvVariable(key, value string) string {
+	if key == "" {
+		return "错误：变量名不能为空"
+	}
 
-	if taskID == "all" {
-		// Clear all logs
-		a.TaskLogs = make(TaskLogs)
+	a.envMutex.Lock()
+	a.envVariables[key] = EnvVariableData{Value: value, Separator: ""}
+	a.envMutex.Unlock()
 
-		// Delete all log files
-		files, err := os.ReadDir(logsPath)
-		if err != nil {
-			return err
+	if err := a.saveEnvVariables(); err != nil {
+		return fmt.Sprintf("保存失败：%v", err)
+	}
+
+	return fmt.Sprintf("环境变量 '%s' 设置成功", key)
+}
+
+// SetEnvVariableWithSeparator 设置环境变量（支持分隔符）
+func (a *App) SetEnvVariableWithSeparator(key, dataJson string) string {
+	if key == "" {
+		return "错误：变量名不能为空"
+	}
+
+	var data EnvVariableData
+	if err := json.Unmarshal([]byte(dataJson), &data); err != nil {
+		return fmt.Sprintf("数据格式错误：%v", err)
+	}
+
+	a.envMutex.Lock()
+	a.envVariables[key] = data
+	a.envMutex.Unlock()
+
+	if err := a.saveEnvVariables(); err != nil {
+		return fmt.Sprintf("保存失败：%v", err)
+	}
+
+	return fmt.Sprintf("环境变量 '%s' 设置成功", key)
+}
+
+// DeleteEnvVariable 删除环境变量
+func (a *App) DeleteEnvVariable(key string) string {
+	a.envMutex.Lock()
+	defer a.envMutex.Unlock()
+
+	if _, exists := a.envVariables[key]; !exists {
+		return "错误：变量不存在"
+	}
+
+	delete(a.envVariables, key)
+
+	if err := a.saveEnvVariables(); err != nil {
+		return fmt.Sprintf("删除失败：%v", err)
+	}
+
+	return fmt.Sprintf("环境变量 '%s' 删除成功", key)
+}
+
+// UpdateEnvVariable 更新环境变量（向后兼容）
+func (a *App) UpdateEnvVariable(key, value string) string {
+	if key == "" {
+		return "错误：变量名不能为空"
+	}
+
+	a.envMutex.Lock()
+	defer a.envMutex.Unlock()
+
+	if _, exists := a.envVariables[key]; !exists {
+		return "错误：变量不存在"
+	}
+
+	// 保留原有的分隔符设置
+	existing := a.envVariables[key]
+	a.envVariables[key] = EnvVariableData{Value: value, Separator: existing.Separator}
+
+	if err := a.saveEnvVariables(); err != nil {
+		return fmt.Sprintf("更新失败：%v", err)
+	}
+
+	return fmt.Sprintf("环境变量 '%s' 更新成功", key)
+}
+
+// UpdateEnvVariableWithSeparator 更新环境变量（支持分隔符）
+func (a *App) UpdateEnvVariableWithSeparator(key, dataJson string) string {
+	if key == "" {
+		return "错误：变量名不能为空"
+	}
+
+	var data EnvVariableData
+	if err := json.Unmarshal([]byte(dataJson), &data); err != nil {
+		return fmt.Sprintf("数据格式错误：%v", err)
+	}
+
+	a.envMutex.Lock()
+	defer a.envMutex.Unlock()
+
+	if _, exists := a.envVariables[key]; !exists {
+		return "错误：变量不存在"
+	}
+
+	a.envVariables[key] = data
+
+	if err := a.saveEnvVariables(); err != nil {
+		return fmt.Sprintf("更新失败：%v", err)
+	}
+
+	return fmt.Sprintf("环境变量 '%s' 更新成功", key)
+}
+
+// PreviewTaskWithVariables 预览任务配置（替换环境变量后）
+func (a *App) PreviewTaskWithVariables(taskID string) map[string]interface{} {
+	a.cacheMutex.RLock()
+	task, exists := a.tasksCache[taskID]
+	a.cacheMutex.RUnlock()
+
+	if !exists {
+		return map[string]interface{}{
+			"error": "任务不存在",
 		}
+	}
 
-		for _, file := range files {
-			if file.IsDir() || !strings.HasSuffix(file.Name(), ".log") {
-				continue
+	// 创建任务副本并替换变量
+	preview := map[string]interface{}{
+		"id":          task.ID,
+		"name":        task.Name,
+		"url":         a.replaceVariables(task.URL),
+		"method":      task.Method,
+		"data":        a.replaceVariables(task.Data),
+		"headersText": a.replaceVariables(task.HeadersText),
+		"headers":     make(map[string]string),
+	}
+
+	// 替换headers中的变量
+	headers := make(map[string]string)
+	for k, v := range task.Headers {
+		headers[a.replaceVariables(k)] = a.replaceVariables(v)
+	}
+	preview["headers"] = headers
+
+	return preview
+}
+
+// replaceVariables 替换字符串中的环境变量
+func (a *App) replaceVariables(text string) string {
+	if text == "" {
+		return text
+	}
+
+	a.envMutex.RLock()
+	defer a.envMutex.RUnlock()
+
+	result := text
+	// 使用正则表达式查找 {{VARIABLE_NAME}} 格式的占位符
+	// 为了避免无限递归，最多替换10次
+	for i := 0; i < 10; i++ {
+		oldResult := result
+		for key, value := range a.envVariables {
+			placeholder := fmt.Sprintf("{{%s}}", key)
+			result = strings.ReplaceAll(result, placeholder, value.Value)
+		}
+		// 如果没有变化，说明替换完成
+		if result == oldResult {
+			break
+		}
+	}
+
+	return result
+}
+
+// createTaskWithVariables 创建替换了环境变量的任务副本
+func (a *App) createTaskWithVariables(task *Task) *Task {
+	// 创建任务副本
+	taskCopy := *task
+
+	// 替换各个字段中的变量
+	taskCopy.URL = a.replaceVariables(task.URL)
+	taskCopy.Data = a.replaceVariables(task.Data)
+	taskCopy.HeadersText = a.replaceVariables(task.HeadersText)
+
+	// 替换headers中的变量
+	taskCopy.Headers = make(map[string]string)
+	for k, v := range task.Headers {
+		newKey := a.replaceVariables(k)
+		newValue := a.replaceVariables(v)
+		taskCopy.Headers[newKey] = newValue
+	}
+
+	return &taskCopy
+}
+
+// createTasksWithSeparatedVariables 创建支持分隔符的任务副本列表
+func (a *App) createTasksWithSeparatedVariables(task *Task) []*Task {
+	a.envMutex.RLock()
+	defer a.envMutex.RUnlock()
+
+	// 查找包含分隔符的环境变量
+	var separatedVars []map[string]string
+	hasSeperatedVars := false
+
+	for key, envVar := range a.envVariables {
+		if envVar.Separator != "" {
+			// 分割变量值
+			separators := strings.Split(envVar.Separator, ",")
+			values := []string{envVar.Value}
+
+			for _, sep := range separators {
+				sep = strings.TrimSpace(sep)
+				if sep == "" {
+					continue
+				}
+
+				var newValues []string
+				for _, val := range values {
+					newValues = append(newValues, strings.Split(val, sep)...)
+				}
+				values = newValues
 			}
 
-			err := os.Remove(filepath.Join(logsPath, file.Name()))
-			if err != nil {
-				fmt.Printf("Error deleting log file %s: %v\n", file.Name(), err)
+			// 清理空值
+			var cleanValues []string
+			for _, val := range values {
+				val = strings.TrimSpace(val)
+				if val != "" {
+					cleanValues = append(cleanValues, val)
+				}
+			}
+
+			if len(cleanValues) > 1 {
+				hasSeperatedVars = true
+				// 为每个分割后的值创建变量映射
+				for i, val := range cleanValues {
+					if i >= len(separatedVars) {
+						separatedVars = append(separatedVars, make(map[string]string))
+					}
+					separatedVars[i][key] = val
+				}
 			}
 		}
+	}
+
+	// 如果没有分隔符变量，返回单个任务
+	if !hasSeperatedVars {
+		return []*Task{a.createTaskWithVariables(task)}
+	}
+
+	// 创建多个任务副本，每个使用不同的变量值
+	var tasks []*Task
+	for _, varMap := range separatedVars {
+		taskCopy := *task
+
+		// 替换各个字段中的变量
+		taskCopy.URL = a.replaceVariablesWithMap(task.URL, varMap)
+		taskCopy.Data = a.replaceVariablesWithMap(task.Data, varMap)
+		taskCopy.HeadersText = a.replaceVariablesWithMap(task.HeadersText, varMap)
+
+		// 替换headers中的变量
+		taskCopy.Headers = make(map[string]string)
+		for k, v := range task.Headers {
+			newKey := a.replaceVariablesWithMap(k, varMap)
+			newValue := a.replaceVariablesWithMap(v, varMap)
+			taskCopy.Headers[newKey] = newValue
+		}
+
+		tasks = append(tasks, &taskCopy)
+	}
+
+	return tasks
+}
+
+// replaceVariablesWithMap 使用指定的变量映射替换变量
+func (a *App) replaceVariablesWithMap(text string, varMap map[string]string) string {
+	if text == "" {
+		return text
+	}
+
+	result := text
+	// 首先使用指定的变量映射
+	for key, value := range varMap {
+		placeholder := fmt.Sprintf("{{%s}}", key)
+		result = strings.ReplaceAll(result, placeholder, value)
+	}
+
+	// 然后使用其他环境变量
+	a.envMutex.RLock()
+	defer a.envMutex.RUnlock()
+
+	for key, envVar := range a.envVariables {
+		if _, exists := varMap[key]; !exists {
+			placeholder := fmt.Sprintf("{{%s}}", key)
+			result = strings.ReplaceAll(result, placeholder, envVar.Value)
+		}
+	}
+
+	return result
+}
+
+// evaluateSuccessCondition 评估成功条件（保持向后兼容）
+func (a *App) evaluateSuccessCondition(task *Task, resp *http.Response, responseBody string) bool {
+	result, _ := a.evaluateSuccessConditionWithDetails(task, resp, responseBody)
+	return result
+}
+
+// evaluateSuccessConditionWithDetails 评估成功条件并返回详细信息
+func (a *App) evaluateSuccessConditionWithDetails(task *Task, resp *http.Response, responseBody string) (bool, *SuccessConditionDetails) {
+	// 添加调试日志
+	fmt.Printf("=== 成功条件评估调试 ===\n")
+	fmt.Printf("启用状态: %v\n", task.SuccessCondition.Enabled)
+	fmt.Printf("JSON路径: %s\n", task.SuccessCondition.JsonPath)
+	fmt.Printf("操作符: %s\n", task.SuccessCondition.Operator)
+	fmt.Printf("期望值: %s\n", task.SuccessCondition.ExpectedValue)
+	fmt.Printf("响应体: %s\n", responseBody)
+
+	// 判断是否为字符串基础的条件
+	isStringBased := task.SuccessCondition.Operator == "response_contains" ||
+		task.SuccessCondition.Operator == "response_not_contains" ||
+		task.SuccessCondition.Operator == "response_equals" ||
+		task.SuccessCondition.Operator == "response_not_equals"
+
+	details := &SuccessConditionDetails{
+		Type:          "json_path",
+		JsonPath:      task.SuccessCondition.JsonPath,
+		Operator:      task.SuccessCondition.Operator,
+		ExpectedValue: task.SuccessCondition.ExpectedValue,
+	}
+
+	if isStringBased {
+		details.Type = "string_based"
+		details.JsonPath = "" // 字符串基础条件不使用JSON路径
+	}
+
+	// 如果没有启用自定义成功条件，使用默认的HTTP状态码判断
+	if !task.SuccessCondition.Enabled {
+		fmt.Printf("未启用自定义成功条件，使用HTTP状态码判断\n")
+		result := resp.StatusCode >= 200 && resp.StatusCode < 300
+		details.Type = "http_status"
+		details.ActualValue = fmt.Sprintf("%d", resp.StatusCode)
+		details.Result = result
+		details.Reason = "未启用自定义成功条件，使用HTTP状态码判断"
+		return result, details
+	}
+
+	// 如果是字符串基础的条件，直接对响应体进行判断
+	if isStringBased {
+		fmt.Printf("使用字符串基础条件判断\n")
+		return a.evaluateStringBasedCondition(task, responseBody, details)
+	}
+
+	// 如果没有设置JSON路径，使用默认判断
+	if task.SuccessCondition.JsonPath == "" {
+		fmt.Printf("JSON路径为空，使用HTTP状态码判断\n")
+		result := resp.StatusCode >= 200 && resp.StatusCode < 300
+		details.Type = "http_status"
+		details.ActualValue = fmt.Sprintf("%d", resp.StatusCode)
+		details.Result = result
+		details.Reason = "JSON路径为空，使用HTTP状态码判断"
+		return result, details
+	}
+
+	// 如果响应体为空，无法进行JSON路径判断
+	if responseBody == "" {
+		fmt.Printf("响应体为空，返回false\n")
+		details.ActualValue = ""
+		details.Result = false
+		details.Reason = "响应体为空，无法进行JSON路径判断"
+		return false, details
+	}
+
+	// 清理响应体：移除BOM和前后空格
+	cleanedBody := a.cleanResponseBody(responseBody)
+	fmt.Printf("清理后的响应体: %s\n", cleanedBody)
+
+	// 解析JSON响应
+	var jsonData interface{}
+	if err := json.Unmarshal([]byte(cleanedBody), &jsonData); err != nil {
+		// JSON解析失败，显示详细错误信息
+		fmt.Printf("JSON解析失败: %v\n", err)
+		fmt.Printf("原始响应体长度: %d\n", len(responseBody))
+		fmt.Printf("清理后响应体长度: %d\n", len(cleanedBody))
+		if len(cleanedBody) > 0 {
+			fmt.Printf("响应体前10个字符的字节值: %v\n", []byte(cleanedBody[:min(10, len(cleanedBody))]))
+		}
+		details.ActualValue = "JSON解析失败"
+		details.Result = false
+		details.Reason = fmt.Sprintf("JSON解析失败: %v", err)
+		return false, details
+	}
+
+	// 获取JSON路径对应的值
+	value := a.getJsonPathValue(jsonData, task.SuccessCondition.JsonPath)
+	if value == nil {
+		fmt.Printf("JSON路径 %s 对应的值为nil\n", task.SuccessCondition.JsonPath)
+		details.ActualValue = "null"
+		details.Result = false
+		details.Reason = fmt.Sprintf("JSON路径 %s 对应的值为null", task.SuccessCondition.JsonPath)
+		return false, details
+	}
+
+	fmt.Printf("JSON路径 %s 对应的值: %v\n", task.SuccessCondition.JsonPath, value)
+
+	// 设置实际值
+	details.ActualValue = fmt.Sprintf("%v", value)
+
+	// 根据操作符进行判断
+	result := a.evaluateCondition(value, task.SuccessCondition.Operator, task.SuccessCondition.ExpectedValue)
+	details.Result = result
+
+	// 设置详细说明
+	switch task.SuccessCondition.Operator {
+	case "equals":
+		details.Reason = fmt.Sprintf("检查 '%s' 是否等于 '%s'", details.ActualValue, details.ExpectedValue)
+	case "not_equals":
+		details.Reason = fmt.Sprintf("检查 '%s' 是否不等于 '%s'", details.ActualValue, details.ExpectedValue)
+	case "contains":
+		details.Reason = fmt.Sprintf("检查 '%s' 是否包含 '%s'", details.ActualValue, details.ExpectedValue)
+	case "not_contains":
+		details.Reason = fmt.Sprintf("检查 '%s' 是否不包含 '%s'", details.ActualValue, details.ExpectedValue)
+	default:
+		details.Reason = fmt.Sprintf("使用操作符 '%s' 比较 '%s' 和 '%s'", task.SuccessCondition.Operator, details.ActualValue, details.ExpectedValue)
+	}
+
+	fmt.Printf("条件判断结果: %v\n", result)
+	fmt.Printf("=== 成功条件评估结束 ===\n")
+	return result, details
+}
+
+// generateConditionFailureDescription 生成成功条件失败的详细描述
+func (a *App) generateConditionFailureDescription(details *SuccessConditionDetails) string {
+	if details == nil {
+		return "成功条件评估失败，无详细信息"
+	}
+
+	var description strings.Builder
+	description.WriteString("成功条件详情：\n")
+
+	// 条件类型
+	switch details.Type {
+	case "json_path":
+		description.WriteString("- 条件类型：JSON路径判断\n")
+		description.WriteString(fmt.Sprintf("- JSON路径：%s\n", details.JsonPath))
+	case "string_based":
+		description.WriteString("- 条件类型：字符串内容判断\n")
+	case "http_status":
+		description.WriteString("- 条件类型：HTTP状态码判断\n")
+	default:
+		description.WriteString(fmt.Sprintf("- 条件类型：%s\n", details.Type))
+	}
+
+	// 判断条件
+	operatorText := a.getOperatorTextForLog(details.Operator)
+	description.WriteString(fmt.Sprintf("- 判断条件：%s\n", operatorText))
+	description.WriteString(fmt.Sprintf("- 期望值：\"%s\"\n", details.ExpectedValue))
+	description.WriteString(fmt.Sprintf("- 实际值：\"%s\"\n", details.ActualValue))
+
+	// 失败原因
+	description.WriteString(fmt.Sprintf("- 失败原因：%s", details.Reason))
+
+	return description.String()
+}
+
+// generateHttpErrorDescription 生成HTTP错误的详细描述
+func (a *App) generateHttpErrorDescription(statusCode int) string {
+	var description strings.Builder
+	description.WriteString("HTTP状态错误详情：\n")
+	description.WriteString(fmt.Sprintf("- 状态码：%d\n", statusCode))
+
+	if statusCode >= 400 && statusCode < 500 {
+		description.WriteString("- 错误类型：客户端错误\n")
+		switch statusCode {
+		case 400:
+			description.WriteString("- 详细说明：请求参数错误，请检查URL、请求头或请求体格式")
+		case 401:
+			description.WriteString("- 详细说明：未授权访问，请检查认证信息")
+		case 403:
+			description.WriteString("- 详细说明：访问被禁止，请检查权限设置")
+		case 404:
+			description.WriteString("- 详细说明：请求的资源不存在，请检查URL是否正确")
+		case 405:
+			description.WriteString("- 详细说明：请求方法不被允许，请检查HTTP方法")
+		case 408:
+			description.WriteString("- 详细说明：请求超时，请稍后重试")
+		case 429:
+			description.WriteString("- 详细说明：请求过于频繁，请降低请求频率")
+		default:
+			description.WriteString("- 详细说明：客户端请求错误，请检查请求参数")
+		}
+	} else if statusCode >= 500 {
+		description.WriteString("- 错误类型：服务器错误\n")
+		switch statusCode {
+		case 500:
+			description.WriteString("- 详细说明：服务器内部错误，请稍后重试")
+		case 502:
+			description.WriteString("- 详细说明：网关错误，服务器暂时不可用")
+		case 503:
+			description.WriteString("- 详细说明：服务不可用，服务器过载或维护中")
+		case 504:
+			description.WriteString("- 详细说明：网关超时，上游服务器响应超时")
+		default:
+			description.WriteString("- 详细说明：服务器错误，请稍后重试")
+		}
+	} else if statusCode >= 300 && statusCode < 400 {
+		description.WriteString("- 错误类型：重定向\n")
+		description.WriteString("- 详细说明：请求被重定向，可能需要处理跳转逻辑")
 	} else {
-		// Clear logs for a specific task
-		delete(a.TaskLogs, taskID)
-
-		// Delete the log file
-		taskLogPath := filepath.Join(logsPath, taskID+".log")
-		err := os.Remove(taskLogPath)
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
+		description.WriteString("- 错误类型：未知错误\n")
+		description.WriteString("- 详细说明：HTTP状态码不在成功范围内（200-299）")
 	}
 
-	return nil
+	return description.String()
 }
 
-// DeleteOldTaskLogs deletes logs older than the specified number of days
-func (a *App) DeleteOldTaskLogs(days int) *DeleteLogsResult {
-	if days <= 0 {
-		days = 7 // Default to 7 days
-	}
-
-	cutoffDate := time.Now().AddDate(0, 0, -days)
-	deletedCount := 0
-
-	// Process each task's logs
-	for taskID, logs := range a.TaskLogs {
-		if len(logs) == 0 {
-			continue
-		}
-
-		filteredLogs := make([]string, 0, len(logs))
-
-		for _, log := range logs {
-			// Try to extract date from log entry (format: [YYYY-MM-DD] [HH:MM:SS.SSS] ...)
-			dateMatch := strings.Split(log, "]")
-			if len(dateMatch) < 2 {
-				// Keep entries without valid date format
-				filteredLogs = append(filteredLogs, log)
-				continue
-			}
-
-			dateStr := strings.TrimPrefix(dateMatch[0], "[")
-			logDate, err := time.Parse("2006-01-02", dateStr)
-			if err != nil {
-				// Keep entries with invalid date format
-				filteredLogs = append(filteredLogs, log)
-				continue
-			}
-
-			// Keep logs newer than cutoff date
-			if !logDate.Before(cutoffDate) {
-				filteredLogs = append(filteredLogs, log)
-			}
-		}
-
-		deletedCount += len(logs) - len(filteredLogs)
-
-		if len(filteredLogs) > 0 {
-			a.TaskLogs[taskID] = filteredLogs
-		} else {
-			delete(a.TaskLogs, taskID)
-		}
-	}
-
-	// Save changes to disk
-	a.saveTaskLogsToDisk()
-
-	return &DeleteLogsResult{
-		Count: deletedCount,
-		Path:  a.getLogsPath(),
+// getOperatorTextForLog 获取操作符的中文文本（用于日志）
+func (a *App) getOperatorTextForLog(operator string) string {
+	switch operator {
+	case "equals":
+		return "等于"
+	case "not_equals":
+		return "不等于"
+	case "contains":
+		return "包含"
+	case "not_contains":
+		return "不包含"
+	case "response_contains":
+		return "响应包含"
+	case "response_not_contains":
+		return "响应不包含"
+	case "response_equals":
+		return "响应等于"
+	case "response_not_equals":
+		return "响应不等于"
+	default:
+		return operator
 	}
 }
 
-// addTaskLog adds a log entry for a task
-func (a *App) addTaskLog(taskID string, message string) {
-	if a.TaskLogs == nil {
-		a.TaskLogs = make(TaskLogs)
+// evaluateStringBasedCondition 评估字符串基础的成功条件
+func (a *App) evaluateStringBasedCondition(task *Task, responseBody string, details *SuccessConditionDetails) (bool, *SuccessConditionDetails) {
+	// 清理响应体
+	cleanedBody := a.cleanResponseBody(responseBody)
+	details.ActualValue = fmt.Sprintf("响应体长度: %d 字符", len(cleanedBody))
+
+	var result bool
+	switch task.SuccessCondition.Operator {
+	case "response_contains":
+		result = strings.Contains(cleanedBody, task.SuccessCondition.ExpectedValue)
+		details.Reason = fmt.Sprintf("检查响应体是否包含 '%s'", task.SuccessCondition.ExpectedValue)
+	case "response_not_contains":
+		result = !strings.Contains(cleanedBody, task.SuccessCondition.ExpectedValue)
+		details.Reason = fmt.Sprintf("检查响应体是否不包含 '%s'", task.SuccessCondition.ExpectedValue)
+	case "response_equals":
+		result = cleanedBody == task.SuccessCondition.ExpectedValue
+		details.Reason = fmt.Sprintf("检查响应体是否等于指定内容")
+		details.ActualValue = cleanedBody // 对于equals，显示完整内容
+	case "response_not_equals":
+		result = cleanedBody != task.SuccessCondition.ExpectedValue
+		details.Reason = fmt.Sprintf("检查响应体是否不等于指定内容")
+		details.ActualValue = cleanedBody // 对于not_equals，显示完整内容
+	default:
+		result = false
+		details.Reason = fmt.Sprintf("未知的字符串基础操作符: %s", task.SuccessCondition.Operator)
 	}
 
-	if _, exists := a.TaskLogs[taskID]; !exists {
-		a.TaskLogs[taskID] = make([]string, 0)
-	}
-
-	// Format: [YYYY-MM-DD] [HH:MM:SS.SSS] message
-	now := time.Now()
-	dateStr := now.Format("2006-01-02")
-	timeStr := now.Format("15:04:05.000")
-
-	logEntry := fmt.Sprintf("[%s] [%s] %s", dateStr, timeStr, message)
-	a.TaskLogs[taskID] = append(a.TaskLogs[taskID], logEntry)
+	details.Result = result
+	fmt.Printf("字符串基础条件判断结果: %v\n", result)
+	return result, details
 }
 
-// truncateString truncates a string to the specified length
-func truncateString(s string, maxLength int) string {
-	if len(s) <= maxLength {
-		return s
+// getJsonPathValue 根据JSON路径获取值
+func (a *App) getJsonPathValue(data interface{}, path string) interface{} {
+	if path == "" {
+		return data
 	}
-	return s[:maxLength] + "..."
+
+	// 分割路径
+	parts := strings.Split(path, ".")
+	current := data
+
+	for _, part := range parts {
+		switch v := current.(type) {
+		case map[string]interface{}:
+			if val, exists := v[part]; exists {
+				current = val
+			} else {
+				return nil
+			}
+		default:
+			return nil
+		}
+	}
+
+	return current
+}
+
+// evaluateCondition 评估条件
+func (a *App) evaluateCondition(actualValue interface{}, operator, expectedValue string) bool {
+	// 将实际值转换为字符串进行比较
+	actualStr := fmt.Sprintf("%v", actualValue)
+
+	fmt.Printf("--- 条件判断详情 ---\n")
+	fmt.Printf("实际值: '%s'\n", actualStr)
+	fmt.Printf("操作符: '%s'\n", operator)
+	fmt.Printf("期望值: '%s'\n", expectedValue)
+
+	var result bool
+	switch operator {
+	case "equals":
+		result = actualStr == expectedValue
+		fmt.Printf("等于判断: '%s' == '%s' = %v\n", actualStr, expectedValue, result)
+	case "not_equals":
+		result = actualStr != expectedValue
+		fmt.Printf("不等于判断: '%s' != '%s' = %v\n", actualStr, expectedValue, result)
+	case "contains":
+		result = strings.Contains(actualStr, expectedValue)
+		fmt.Printf("包含判断: '%s' contains '%s' = %v\n", actualStr, expectedValue, result)
+	case "not_contains":
+		result = !strings.Contains(actualStr, expectedValue)
+		fmt.Printf("不包含判断: '%s' not contains '%s' = %v\n", actualStr, expectedValue, result)
+	default:
+		// 未知操作符，使用等于判断
+		result = actualStr == expectedValue
+		fmt.Printf("未知操作符 '%s'，使用等于判断: '%s' == '%s' = %v\n", operator, actualStr, expectedValue, result)
+	}
+	fmt.Printf("--- 条件判断结束 ---\n")
+	return result
+}
+
+// cleanResponseBody 清理响应体，移除BOM和前后空格
+func (a *App) cleanResponseBody(responseBody string) string {
+	// 转换为字节数组进行处理
+	bodyBytes := []byte(responseBody)
+
+	// 检测并移除UTF-8 BOM (EF BB BF)
+	if len(bodyBytes) >= 3 && bodyBytes[0] == 0xEF && bodyBytes[1] == 0xBB && bodyBytes[2] == 0xBF {
+		fmt.Printf("检测到UTF-8 BOM，正在移除\n")
+		bodyBytes = bodyBytes[3:]
+	}
+
+	// 检测并移除UTF-16 BE BOM (FE FF)
+	if len(bodyBytes) >= 2 && bodyBytes[0] == 0xFE && bodyBytes[1] == 0xFF {
+		fmt.Printf("检测到UTF-16 BE BOM，正在移除\n")
+		bodyBytes = bodyBytes[2:]
+	}
+
+	// 检测并移除UTF-16 LE BOM (FF FE)
+	if len(bodyBytes) >= 2 && bodyBytes[0] == 0xFF && bodyBytes[1] == 0xFE {
+		fmt.Printf("检测到UTF-16 LE BOM，正在移除\n")
+		bodyBytes = bodyBytes[2:]
+	}
+
+	// 转换回字符串并去除前后空格
+	cleanedBody := strings.TrimSpace(string(bodyBytes))
+
+	// 移除其他可能的不可见字符
+	cleanedBody = strings.TrimFunc(cleanedBody, func(r rune) bool {
+		// 移除控制字符，但保留换行符和制表符
+		return r < 32 && r != '\n' && r != '\r' && r != '\t'
+	})
+
+	return cleanedBody
+}
+
+// min 返回两个整数中的较小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
