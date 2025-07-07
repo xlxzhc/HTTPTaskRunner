@@ -3,7 +3,7 @@
     <!-- 导航栏 -->
     <nav class="navbar">
       <div class="nav-brand">
-        <h1>任务管理器</h1>
+        <h1>HTTPTaskRunner</h1>
       </div>
       <div class="nav-tabs">
         <button 

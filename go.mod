@@ -1,4 +1,4 @@
-module myui
+module HTTPTaskRunner
 
 go 1.23
 

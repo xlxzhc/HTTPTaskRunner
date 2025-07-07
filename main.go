@@ -17,7 +17,7 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:     "通用卡包优化版-go",
+		Title:     "HTTPTaskRunner",
 		Width:     900,
 		Height:    800,
 		MinWidth:  800,
