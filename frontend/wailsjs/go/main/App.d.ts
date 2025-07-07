@@ -30,6 +30,8 @@ export function GetTaskScheduleInfo(arg1:string):Promise<main.TaskScheduleInfo>;
 
 export function GetTasks(arg1:number,arg2:number):Promise<main.TaskList>;
 
+export function GetVersionInfo():Promise<main.VersionInfo>;
+
 export function PreviewTaskWithVariables(arg1:string):Promise<Record<string, any>>;
 
 export function SaveTask(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:number,arg7:number,arg8:number,arg9:number,arg10:Array<string>,arg11:string,arg12:main.SuccessCondition):Promise<string>;

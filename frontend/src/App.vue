@@ -17,6 +17,7 @@
         </button>
       </div>
       <div class="nav-info">
+        <span class="version">{{ versionInfo.name }} v{{ versionInfo.version }}</span>
         <span class="time">{{ currentTime }}</span>
       </div>
     </nav>
@@ -77,7 +78,7 @@ import TaskList from './components/TaskList.vue'
 import TaskForm from './components/TaskForm.vue'
 import ExecutionLogs from './components/ExecutionLogs.vue'
 import EnvVariables from './components/EnvVariables.vue'
-import { GetTasks, GetTaskCount, SaveTask, UpdateTask, DeleteTask, ExecuteTask, TestTaskWithBackend, StopTask, GetTaskLogs, ScheduleTask, UnscheduleTask, GetScheduledTasks } from '../wailsjs/go/main/App'
+import { GetTasks, GetTaskCount, SaveTask, UpdateTask, DeleteTask, ExecuteTask, TestTaskWithBackend, StopTask, GetTaskLogs, ScheduleTask, UnscheduleTask, GetScheduledTasks, GetVersionInfo } from '../wailsjs/go/main/App'
 
 // 响应式数据
 const activeTab = ref('list')
@@ -90,6 +91,7 @@ const currentTask = ref(null)
 const logs = ref<Array<{time: string, message: string, level?: 'info' | 'success' | 'warning' | 'error'}>>([])
 const scheduledTasks = ref<string[]>([])
 const taskListRef = ref<any>(null)
+const versionInfo = ref({ name: 'HTTPTaskRunner', version: '1.0.0', buildDate: '2025-01-07' })
 
 // 标签页配置
 const tabs = [
@@ -414,11 +416,22 @@ const formatDuration = (seconds: number): string => {
 }
 
 // 生命周期
+// 加载版本信息
+const loadVersionInfo = async () => {
+  try {
+    const version = await GetVersionInfo()
+    versionInfo.value = version
+  } catch (error) {
+    console.error('获取版本信息失败:', error)
+  }
+}
+
 onMounted(() => {
   updateTime()
   timeInterval = setInterval(updateTime, 1000)
   loadTasks()
   loadScheduledTasks()
+  loadVersionInfo()
 })
 
 onUnmounted(() => {
@@ -480,6 +493,16 @@ onUnmounted(() => {
 
 .nav-info {
   margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.version {
+  font-size: 0.85rem;
+  color: #666;
+  font-weight: 500;
 }
 
 .time {

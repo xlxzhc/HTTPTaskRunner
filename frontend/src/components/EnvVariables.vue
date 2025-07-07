@@ -251,30 +251,30 @@ const saveVariable = async () => {
       separator: dialogData.value.separator || ''
     }
 
+    let result = ''
     if (showEditDialog.value) {
       try {
         const { UpdateEnvVariableWithSeparator } = await import('../../wailsjs/go/main/App')
-        const result = await UpdateEnvVariableWithSeparator(dialogData.value.key, JSON.stringify(variableData))
-        showMessage(result, 'success')
+        result = await UpdateEnvVariableWithSeparator(dialogData.value.key, JSON.stringify(variableData))
       } catch (error) {
         // 降级到旧API（如果新API还没有生成）
         const { UpdateEnvVariable } = await import('../../wailsjs/go/main/App')
-        const result = await UpdateEnvVariable(dialogData.value.key, dialogData.value.value)
-        showMessage(result + '（注意：分隔符功能需要重新编译后端）', 'warning')
+        result = await UpdateEnvVariable(dialogData.value.key, dialogData.value.value)
+        result += '（注意：分隔符功能需要重新编译后端）'
       }
     } else {
       try {
         const { SetEnvVariableWithSeparator } = await import('../../wailsjs/go/main/App')
-        const result = await SetEnvVariableWithSeparator(dialogData.value.key, JSON.stringify(variableData))
-        showMessage(result, 'success')
+        result = await SetEnvVariableWithSeparator(dialogData.value.key, JSON.stringify(variableData))
       } catch (error) {
         // 降级到旧API（如果新API还没有生成）
         const { SetEnvVariable } = await import('../../wailsjs/go/main/App')
-        const result = await SetEnvVariable(dialogData.value.key, dialogData.value.value)
-        showMessage(result + '（注意：分隔符功能需要重新编译后端）', 'warning')
+        result = await SetEnvVariable(dialogData.value.key, dialogData.value.value)
+        result += '（注意：分隔符功能需要重新编译后端）'
       }
     }
-    
+
+    showMessage(result, 'success')
     closeDialogs()
     await loadEnvVariables()
   } catch (error) {
@@ -287,6 +287,7 @@ const saveVariable = async () => {
 const closeDialogs = () => {
   showAddDialog.value = false
   showEditDialog.value = false
+  saving.value = false  // 重置保存状态
   separatorTestResult.value = []
   dialogData.value = {
     key: '',
@@ -489,10 +490,11 @@ onMounted(() => {
 .dialog {
   background: white;
   border-radius: 8px;
-  width: 90%;
-  max-width: 500px;
+  width: 95%;
+  max-width: 800px;
   max-height: 90vh;
   overflow-y: auto;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
 }
 
 .dialog-header {
@@ -518,6 +520,8 @@ onMounted(() => {
 
 .dialog-body {
   padding: 20px;
+  overflow-x: hidden;
+  word-wrap: break-word;
 }
 
 .form-group {
@@ -537,11 +541,16 @@ onMounted(() => {
   border: 1px solid #ddd;
   border-radius: 4px;
   font-size: 1rem;
+  box-sizing: border-box;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
 }
 
 .form-textarea {
   resize: vertical;
-  min-height: 80px;
+  min-height: 120px;
+  font-family: 'Courier New', monospace;
+  line-height: 1.4;
 }
 
 .hint {
@@ -557,6 +566,10 @@ onMounted(() => {
   border-radius: 4px;
   font-size: 0.9rem;
   color: #495057;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .preview code {

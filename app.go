@@ -17,6 +17,20 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// 版本信息
+const (
+	AppVersion = "1.0.0"
+	AppName    = "HTTPTaskRunner"
+	BuildDate  = "2025-01-07"
+)
+
+// VersionInfo - 版本信息结构
+type VersionInfo struct {
+	Version   string `json:"version"`
+	Name      string `json:"name"`
+	BuildDate string `json:"buildDate"`
+}
+
 // App - 重新设计的应用结构，优化性能
 type App struct {
 	ctx           context.Context
@@ -2535,4 +2549,13 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// GetVersionInfo 获取应用版本信息
+func (a *App) GetVersionInfo() VersionInfo {
+	return VersionInfo{
+		Version:   AppVersion,
+		Name:      AppName,
+		BuildDate: BuildDate,
+	}
 }
