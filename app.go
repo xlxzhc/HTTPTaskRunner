@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/robfig/cron/v3"
 )
 
@@ -50,6 +52,9 @@ type App struct {
 	// 环境变量管理
 	envVariables map[string]EnvVariableData // 环境变量存储（支持分隔符）
 	envMutex     sync.RWMutex               // 环境变量锁
+	// 数据库管理
+	db      *sql.DB      // SQLite数据库连接
+	dbMutex sync.RWMutex // 数据库操作锁
 }
 
 // SuccessCondition - 成功条件配置
@@ -106,7 +111,7 @@ type TaskList struct {
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	return &App{
+	app := &App{
 		runningTasks:  make(map[string]*TaskProgress),
 		cronJobs:      make(map[string]cron.EntryID),
 		tasksCache:    make(map[string]*Task),
@@ -116,6 +121,13 @@ func NewApp() *App {
 		// 支持秒字段的cron调度器
 		cronScheduler: cron.New(cron.WithSeconds()),
 	}
+
+	// 初始化数据库
+	if err := app.initDatabase(); err != nil {
+		fmt.Printf("数据库初始化失败: %v\n", err)
+	}
+
+	return app
 }
 
 // OnStartup is called when the app starts up
@@ -139,6 +151,9 @@ func (a *App) OnDomReady(ctx context.Context) {
 // OnShutdown is called when the app is shutting down
 func (a *App) OnShutdown(ctx context.Context) {
 	a.cronScheduler.Stop()
+	if err := a.closeDatabase(); err != nil {
+		fmt.Printf("关闭数据库失败: %v\n", err)
+	}
 }
 
 // preloadTasks 预加载任务数据到缓存
@@ -1862,11 +1877,14 @@ func (a *App) saveEnvVariables() error {
 
 // GetEnvVariables 获取所有环境变量（向后兼容，返回字符串格式）
 func (a *App) GetEnvVariables() map[string]string {
-	a.envMutex.RLock()
-	defer a.envMutex.RUnlock()
+	envVars, err := a.dbGetAllEnvVariables()
+	if err != nil {
+		fmt.Printf("获取环境变量失败: %v\n", err)
+		return make(map[string]string)
+	}
 
 	result := make(map[string]string)
-	for k, v := range a.envVariables {
+	for k, v := range envVars {
 		result[k] = v.Value
 	}
 	return result
@@ -1874,14 +1892,12 @@ func (a *App) GetEnvVariables() map[string]string {
 
 // GetEnvVariablesWithSeparator 获取所有环境变量（包含分隔符信息）
 func (a *App) GetEnvVariablesWithSeparator() map[string]EnvVariableData {
-	a.envMutex.RLock()
-	defer a.envMutex.RUnlock()
-
-	result := make(map[string]EnvVariableData)
-	for k, v := range a.envVariables {
-		result[k] = v
+	envVars, err := a.dbGetAllEnvVariables()
+	if err != nil {
+		fmt.Printf("获取环境变量失败: %v\n", err)
+		return make(map[string]EnvVariableData)
 	}
-	return result
+	return envVars
 }
 
 // SetEnvVariable 设置环境变量（向后兼容）
@@ -1890,11 +1906,8 @@ func (a *App) SetEnvVariable(key, value string) string {
 		return "错误：变量名不能为空"
 	}
 
-	a.envMutex.Lock()
-	a.envVariables[key] = EnvVariableData{Value: value, Separator: ""}
-	a.envMutex.Unlock()
-
-	if err := a.saveEnvVariables(); err != nil {
+	data := EnvVariableData{Value: value, Separator: ""}
+	if err := a.dbSetEnvVariable(key, data); err != nil {
 		return fmt.Sprintf("保存失败：%v", err)
 	}
 
@@ -1912,11 +1925,7 @@ func (a *App) SetEnvVariableWithSeparator(key, dataJson string) string {
 		return fmt.Sprintf("数据格式错误：%v", err)
 	}
 
-	a.envMutex.Lock()
-	a.envVariables[key] = data
-	a.envMutex.Unlock()
-
-	if err := a.saveEnvVariables(); err != nil {
+	if err := a.dbSetEnvVariable(key, data); err != nil {
 		return fmt.Sprintf("保存失败：%v", err)
 	}
 
@@ -1925,16 +1934,10 @@ func (a *App) SetEnvVariableWithSeparator(key, dataJson string) string {
 
 // DeleteEnvVariable 删除环境变量
 func (a *App) DeleteEnvVariable(key string) string {
-	a.envMutex.Lock()
-	defer a.envMutex.Unlock()
-
-	if _, exists := a.envVariables[key]; !exists {
-		return "错误：变量不存在"
-	}
-
-	delete(a.envVariables, key)
-
-	if err := a.saveEnvVariables(); err != nil {
+	if err := a.dbDeleteEnvVariable(key); err != nil {
+		if err.Error() == "变量不存在" {
+			return "错误：变量不存在"
+		}
 		return fmt.Sprintf("删除失败：%v", err)
 	}
 
@@ -1947,18 +1950,15 @@ func (a *App) UpdateEnvVariable(key, value string) string {
 		return "错误：变量名不能为空"
 	}
 
-	a.envMutex.Lock()
-	defer a.envMutex.Unlock()
-
-	if _, exists := a.envVariables[key]; !exists {
+	// 获取现有变量以保留分隔符设置
+	existing, err := a.dbGetEnvVariable(key)
+	if err != nil {
 		return "错误：变量不存在"
 	}
 
 	// 保留原有的分隔符设置
-	existing := a.envVariables[key]
-	a.envVariables[key] = EnvVariableData{Value: value, Separator: existing.Separator}
-
-	if err := a.saveEnvVariables(); err != nil {
+	data := EnvVariableData{Value: value, Separator: existing.Separator}
+	if err := a.dbSetEnvVariable(key, data); err != nil {
 		return fmt.Sprintf("更新失败：%v", err)
 	}
 
@@ -1976,16 +1976,12 @@ func (a *App) UpdateEnvVariableWithSeparator(key, dataJson string) string {
 		return fmt.Sprintf("数据格式错误：%v", err)
 	}
 
-	a.envMutex.Lock()
-	defer a.envMutex.Unlock()
-
-	if _, exists := a.envVariables[key]; !exists {
+	// 检查变量是否存在
+	if _, err := a.dbGetEnvVariable(key); err != nil {
 		return "错误：变量不存在"
 	}
 
-	a.envVariables[key] = data
-
-	if err := a.saveEnvVariables(); err != nil {
+	if err := a.dbSetEnvVariable(key, data); err != nil {
 		return fmt.Sprintf("更新失败：%v", err)
 	}
 
@@ -2031,15 +2027,18 @@ func (a *App) replaceVariables(text string) string {
 		return text
 	}
 
-	a.envMutex.RLock()
-	defer a.envMutex.RUnlock()
+	envVariables, err := a.dbGetAllEnvVariables()
+	if err != nil {
+		fmt.Printf("获取环境变量失败: %v\n", err)
+		return text
+	}
 
 	result := text
 	// 使用正则表达式查找 {{VARIABLE_NAME}} 格式的占位符
 	// 为了避免无限递归，最多替换10次
 	for i := 0; i < 10; i++ {
 		oldResult := result
-		for key, value := range a.envVariables {
+		for key, value := range envVariables {
 			placeholder := fmt.Sprintf("{{%s}}", key)
 			result = strings.ReplaceAll(result, placeholder, value.Value)
 		}
@@ -2075,14 +2074,17 @@ func (a *App) createTaskWithVariables(task *Task) *Task {
 
 // createTasksWithSeparatedVariables 创建支持分隔符的任务副本列表
 func (a *App) createTasksWithSeparatedVariables(task *Task) []*Task {
-	a.envMutex.RLock()
-	defer a.envMutex.RUnlock()
+	envVariables, err := a.dbGetAllEnvVariables()
+	if err != nil {
+		fmt.Printf("获取环境变量失败: %v\n", err)
+		return []*Task{a.createTaskWithVariables(task)}
+	}
 
 	// 查找包含分隔符的环境变量
 	var separatedVars []map[string]string
 	hasSeperatedVars := false
 
-	for key, envVar := range a.envVariables {
+	for key, envVar := range envVariables {
 		if envVar.Separator != "" {
 			// 分割变量值
 			separators := strings.Split(envVar.Separator, ",")
@@ -2166,10 +2168,13 @@ func (a *App) replaceVariablesWithMap(text string, varMap map[string]string) str
 	}
 
 	// 然后使用其他环境变量
-	a.envMutex.RLock()
-	defer a.envMutex.RUnlock()
+	envVariables, err := a.dbGetAllEnvVariables()
+	if err != nil {
+		fmt.Printf("获取环境变量失败: %v\n", err)
+		return result
+	}
 
-	for key, envVar := range a.envVariables {
+	for key, envVar := range envVariables {
 		if _, exists := varMap[key]; !exists {
 			placeholder := fmt.Sprintf("{{%s}}", key)
 			result = strings.ReplaceAll(result, placeholder, envVar.Value)
@@ -2558,4 +2563,203 @@ func (a *App) GetVersionInfo() VersionInfo {
 		Name:      AppName,
 		BuildDate: BuildDate,
 	}
+}
+
+// ==================== 数据库管理 ====================
+
+// getDatabasePath 获取数据库文件路径
+func (a *App) getDatabasePath() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "httptaskrunner.db"
+	}
+
+	exeDir := filepath.Dir(exePath)
+	return filepath.Join(exeDir, "httptaskrunner.db")
+}
+
+// initDatabase 初始化数据库
+func (a *App) initDatabase() error {
+	dbPath := a.getDatabasePath()
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return fmt.Errorf("打开数据库失败: %v", err)
+	}
+
+	a.db = db
+
+	// 创建环境变量表
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS env_variables (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		separator TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_env_variables_key ON env_variables(key);
+	`
+
+	if _, err := db.Exec(createTableSQL); err != nil {
+		return fmt.Errorf("创建数据库表失败: %v", err)
+	}
+
+	// 执行数据迁移
+	if err := a.migrateFromJSON(); err != nil {
+		fmt.Printf("数据迁移警告: %v\n", err)
+	}
+
+	return nil
+}
+
+// closeDatabase 关闭数据库连接
+func (a *App) closeDatabase() error {
+	if a.db != nil {
+		return a.db.Close()
+	}
+	return nil
+}
+
+// dbGetEnvVariable 从数据库获取单个环境变量
+func (a *App) dbGetEnvVariable(key string) (EnvVariableData, error) {
+	a.dbMutex.RLock()
+	defer a.dbMutex.RUnlock()
+
+	var envVar EnvVariableData
+	query := "SELECT value, separator FROM env_variables WHERE key = ?"
+
+	err := a.db.QueryRow(query, key).Scan(&envVar.Value, &envVar.Separator)
+	if err != nil {
+		return envVar, err
+	}
+
+	return envVar, nil
+}
+
+// dbGetAllEnvVariables 从数据库获取所有环境变量
+func (a *App) dbGetAllEnvVariables() (map[string]EnvVariableData, error) {
+	a.dbMutex.RLock()
+	defer a.dbMutex.RUnlock()
+
+	result := make(map[string]EnvVariableData)
+	query := "SELECT key, value, separator FROM env_variables ORDER BY key"
+
+	rows, err := a.db.Query(query)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var key string
+		var envVar EnvVariableData
+
+		if err := rows.Scan(&key, &envVar.Value, &envVar.Separator); err != nil {
+			return result, err
+		}
+
+		result[key] = envVar
+	}
+
+	return result, rows.Err()
+}
+
+// dbSetEnvVariable 在数据库中设置环境变量
+func (a *App) dbSetEnvVariable(key string, data EnvVariableData) error {
+	a.dbMutex.Lock()
+	defer a.dbMutex.Unlock()
+
+	query := `
+	INSERT OR REPLACE INTO env_variables (key, value, separator, updated_at)
+	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	`
+
+	_, err := a.db.Exec(query, key, data.Value, data.Separator)
+	return err
+}
+
+// dbDeleteEnvVariable 从数据库删除环境变量
+func (a *App) dbDeleteEnvVariable(key string) error {
+	a.dbMutex.Lock()
+	defer a.dbMutex.Unlock()
+
+	query := "DELETE FROM env_variables WHERE key = ?"
+	result, err := a.db.Exec(query, key)
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("变量不存在")
+	}
+
+	return nil
+}
+
+// migrateFromJSON 从JSON文件迁移数据到数据库
+func (a *App) migrateFromJSON() error {
+	envPath := a.getEnvVariablesPath()
+
+	// 检查JSON文件是否存在
+	if _, err := os.Stat(envPath); os.IsNotExist(err) {
+		return nil // 没有JSON文件，无需迁移
+	}
+
+	// 检查数据库是否已有数据
+	count := 0
+	err := a.db.QueryRow("SELECT COUNT(*) FROM env_variables").Scan(&count)
+	if err != nil {
+		return fmt.Errorf("检查数据库状态失败: %v", err)
+	}
+
+	if count > 0 {
+		return nil // 数据库已有数据，跳过迁移
+	}
+
+	// 读取JSON文件
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		return fmt.Errorf("读取JSON文件失败: %v", err)
+	}
+
+	// 尝试解析新格式（包含分隔符）
+	var envVars map[string]EnvVariableData
+	if err := json.Unmarshal(data, &envVars); err != nil {
+		// 尝试解析旧格式（纯字符串）
+		var oldEnvVars map[string]string
+		if err := json.Unmarshal(data, &oldEnvVars); err != nil {
+			return fmt.Errorf("解析JSON文件失败: %v", err)
+		}
+
+		// 转换旧格式到新格式
+		envVars = make(map[string]EnvVariableData)
+		for k, v := range oldEnvVars {
+			envVars[k] = EnvVariableData{Value: v, Separator: ""}
+		}
+	}
+
+	// 迁移数据到数据库
+	for key, data := range envVars {
+		if err := a.dbSetEnvVariable(key, data); err != nil {
+			return fmt.Errorf("迁移变量 %s 失败: %v", key, err)
+		}
+	}
+
+	// 备份原JSON文件
+	backupPath := envPath + ".backup"
+	if err := os.Rename(envPath, backupPath); err != nil {
+		fmt.Printf("备份JSON文件失败: %v\n", err)
+	} else {
+		fmt.Printf("JSON文件已备份为: %s\n", backupPath)
+	}
+
+	fmt.Printf("成功迁移 %d 个环境变量到数据库\n", len(envVars))
+	return nil
 }

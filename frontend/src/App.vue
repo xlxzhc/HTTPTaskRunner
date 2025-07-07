@@ -501,8 +501,14 @@ onUnmounted(() => {
 
 .version {
   font-size: 0.85rem;
-  color: #666;
-  font-weight: 500;
+  color: #3498db;
+  font-weight: 600;
+  background: linear-gradient(135deg, #3498db, #2980b9);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  text-shadow: 0 1px 2px rgba(52, 152, 219, 0.2);
+  letter-spacing: 0.5px;
 }
 
 .time {
