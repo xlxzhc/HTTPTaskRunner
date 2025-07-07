@@ -275,6 +275,13 @@
                         placeholder="搜索日志..."
                         class="log-search"
                       />
+                      <label class="json-format-checkbox">
+                        <input
+                          v-model="formatJsonResponse"
+                          type="checkbox"
+                        />
+                        <span class="checkbox-label">格式化JSON</span>
+                      </label>
                       <button @click="refreshLogs(task.id)" class="btn btn-sm btn-info">刷新</button>
                       <button @click="clearLogs(task.id)" class="btn btn-sm btn-danger btn-clear">清空</button>
                       <button @click="toggleLogs(task.id)" class="btn btn-sm btn-secondary">关闭</button>
@@ -331,6 +338,68 @@
                               </div>
                             </div>
 
+                            <!-- 失败日志聚合显示 -->
+                            <div v-if="executionLogs[logEntry.executionLogId].failedCount > 0" class="failure-groups">
+                              <div class="failure-groups-header">
+                                <span class="failure-groups-title">失败原因汇总</span>
+                                <span class="failure-groups-count">({{ executionLogs[logEntry.executionLogId].failedCount }} 次失败)</span>
+                              </div>
+                              <div
+                                v-for="(requests, errorSummary) in groupFailedRequests(executionLogs[logEntry.executionLogId].detailedLogs)"
+                                :key="errorSummary"
+                                class="failure-group"
+                              >
+                                <div class="failure-group-header" @click="toggleFailureGroup(logEntry.executionLogId, errorSummary)">
+                                  <span class="failure-icon">⚠️</span>
+                                  <span class="failure-summary">{{ errorSummary }}</span>
+                                  <span class="failure-count">({{ requests.length }} 次)</span>
+                                  <span class="expand-icon">{{ expandedFailureGroups[`${logEntry.executionLogId}_${errorSummary}`] ? '▼' : '▶' }}</span>
+                                </div>
+                                <div v-if="expandedFailureGroups[`${logEntry.executionLogId}_${errorSummary}`]" class="failure-group-details">
+                                  <div
+                                    v-for="(request, index) in requests"
+                                    :key="index"
+                                    class="failure-detail-item"
+                                  >
+                                    <span class="failure-detail-status">{{ request.statusCode || 'ERROR' }}</span>
+                                    <div class="failure-detail-reason">{{ getDetailedReasonText(request) }}</div>
+                                    <span class="failure-detail-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
+                            <!-- 成功日志聚合显示 -->
+                            <div v-if="executionLogs[logEntry.executionLogId].successCount > 0" class="success-groups">
+                              <div class="success-groups-header">
+                                <span class="success-groups-title">成功原因汇总</span>
+                                <span class="success-groups-count">({{ executionLogs[logEntry.executionLogId].successCount }} 次成功)</span>
+                              </div>
+                              <div
+                                v-for="(requests, successSummary) in groupSuccessRequests(executionLogs[logEntry.executionLogId].detailedLogs)"
+                                :key="successSummary"
+                                class="success-group"
+                              >
+                                <div class="success-group-header" @click="toggleFailureGroup(logEntry.executionLogId, successSummary)">
+                                  <span class="success-icon">✅</span>
+                                  <span class="success-summary">{{ successSummary }}</span>
+                                  <span class="success-count">({{ requests.length }} 次)</span>
+                                  <span class="expand-icon">{{ expandedFailureGroups[`${logEntry.executionLogId}_${successSummary}`] ? '▼' : '▶' }}</span>
+                                </div>
+                                <div v-if="expandedFailureGroups[`${logEntry.executionLogId}_${successSummary}`]" class="success-group-details">
+                                  <div
+                                    v-for="(request, index) in requests"
+                                    :key="index"
+                                    class="success-detail-item"
+                                  >
+                                    <span class="success-detail-status">{{ request.statusCode || 'OK' }}</span>
+                                    <div class="success-detail-reason">{{ getDetailedReasonText(request) }}</div>
+                                    <span class="success-detail-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
                             <div class="detailed-requests">
                               <div
                                 v-for="(request, index) in executionLogs[logEntry.executionLogId].detailedLogs"
@@ -339,12 +408,12 @@
                                 :class="{ success: request.success, failed: !request.success }"
                               >
                                 <div class="request-header">
-                                  <span class="request-method">{{ request.method }}</span>
-                                  <span class="request-url">{{ request.url }}</span>
                                   <span class="request-status" :class="{ success: request.success, failed: !request.success }">
                                     {{ request.statusCode || 'ERROR' }}
                                   </span>
                                   <span class="request-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                  <span v-if="!request.success" class="request-result-indicator failed">失败</span>
+                                  <span v-else class="request-result-indicator success">成功</span>
                                 </div>
 
                                 <div v-if="request.response" class="request-response">
@@ -355,83 +424,11 @@
                                     {{ showResponseDetails[request.requestId] ? '隐藏响应' : '显示响应' }}
                                   </button>
                                   <div v-if="showResponseDetails[request.requestId]" class="response-content">
-                                    <pre>{{ request.response }}</pre>
+                                    <pre>{{ formatJsonContent(request.response) }}</pre>
                                   </div>
                                 </div>
 
-                                <!-- 简化的错误信息显示 -->
-                                <div v-if="request.error || request.detailedError" class="request-error-simplified">
-                                  <!-- 简洁的失败原因摘要 -->
-                                  <div class="error-summary-line">
-                                    <span class="error-icon">⚠️</span>
-                                    <span class="error-summary-text">{{ getSimplifiedErrorSummary(request) }}</span>
-                                    <button
-                                      @click="toggleErrorDetails(request.requestId)"
-                                      class="error-expand-btn"
-                                      :class="{ 'expanded': showErrorDetails[request.requestId] }"
-                                    >
-                                      <span class="expand-icon">{{ showErrorDetails[request.requestId] ? '▼' : '▶' }}</span>
-                                      {{ showErrorDetails[request.requestId] ? '收起详情' : '展开详情' }}
-                                    </button>
-                                  </div>
 
-                                  <!-- 详细错误信息（可展开） -->
-                                  <div v-if="showErrorDetails[request.requestId]" class="error-details-expanded">
-                                    <!-- 错误类型和徽章 -->
-                                    <div class="error-header">
-                                      <div class="error-label">
-                                        <span class="error-icon">⚠️</span>
-                                        {{ getErrorTypeText(request.errorType) }}
-                                      </div>
-                                      <div class="error-type-badge" :class="getErrorTypeBadgeClass(request.errorType)">
-                                        {{ request.errorType || 'unknown' }}
-                                      </div>
-                                    </div>
-
-                                    <!-- 基础错误信息 -->
-                                    <div v-if="request.error" class="error-summary">
-                                      {{ request.error }}
-                                    </div>
-
-                                    <!-- 详细错误描述 -->
-                                    <div v-if="request.detailedError" class="detailed-error">
-                                      <div class="detailed-error-content">
-                                        <pre>{{ request.detailedError }}</pre>
-                                      </div>
-                                    </div>
-
-                                    <!-- 成功条件详情 -->
-                                    <div v-if="request.successConditionDetails && !request.success" class="condition-error-details">
-                                      <div class="condition-error-header">
-                                        <span class="condition-icon">🎯</span>
-                                        成功条件评估详情
-                                      </div>
-                                      <div class="condition-error-content">
-                                        <div class="condition-item">
-                                          <strong>条件类型：</strong>{{ getConditionTypeText(request.successConditionDetails.type) }}
-                                        </div>
-                                        <div v-if="request.successConditionDetails.jsonPath" class="condition-item">
-                                          <strong>JSON路径：</strong>{{ request.successConditionDetails.jsonPath }}
-                                        </div>
-                                        <div class="condition-item">
-                                          <strong>判断条件：</strong>
-                                          <span :class="{ 'negative-condition': isNegativeCondition(request.successConditionDetails.operator) }">
-                                            {{ getOperatorText(request.successConditionDetails.operator) }}
-                                          </span>
-                                        </div>
-                                        <div class="condition-item">
-                                          <strong>期望值：</strong>"{{ request.successConditionDetails.expectedValue }}"
-                                        </div>
-                                        <div class="condition-item">
-                                          <strong>实际值：</strong>"{{ request.successConditionDetails.actualValue }}"
-                                        </div>
-                                        <div class="condition-item failure-reason">
-                                          <strong>失败原因：</strong>{{ request.successConditionDetails.reason }}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                                </div>
                               </div>
                             </div>
                           </div>
@@ -488,11 +485,12 @@ const taskLogEntries = ref<Record<string, any[]>>({})
 const executionLogs = ref<Record<string, any>>({})
 const expandedLogs = ref<Record<string, boolean>>({})
 const showResponseDetails = ref<Record<string, boolean>>({})
-const showDetailedErrors = ref<Record<string, boolean>>({})
-const showErrorDetails = ref<Record<string, boolean>>({})
-const logSearch = ref<Record<string, string>>({})
 const logSearchQuery = ref('')
 const selectedTags = ref<string[]>([])
+// JSON格式化选项
+const formatJsonResponse = ref(false)
+// 失败日志聚合相关
+const expandedFailureGroups = ref<Record<string, boolean>>({})
 // 快捷编辑相关
 const editingFields = ref<Record<string, Record<string, boolean>>>({})
 const tempValues = ref<Record<string, Record<string, number>>>({})
@@ -623,7 +621,7 @@ const loadExecutionLog = async (logEntryId: string) => {
       // 默认展开所有响应详情
       if (executionLog.detailedLogs && executionLog.detailedLogs.length > 0) {
         executionLog.detailedLogs.forEach((log: any) => {
-          showResponseDetails.value[log.requestId] = false // 默认不展开，用户点击时展开
+          showResponseDetails.value[log.requestId] = true // 默认展开，用户可以查看响应详情
         })
       }
     }
@@ -636,11 +634,6 @@ const toggleResponseDetail = (requestId: string) => {
   showResponseDetails.value[requestId] = !showResponseDetails.value[requestId]
 }
 
-// 切换详细错误信息显示
-const toggleDetailedError = (requestId: string) => {
-  showDetailedErrors.value[requestId] = !showDetailedErrors.value[requestId]
-}
-
 // 获取错误类型文本
 const getErrorTypeText = (errorType: string) => {
   switch (errorType) {
@@ -649,17 +642,6 @@ const getErrorTypeText = (errorType: string) => {
     case 'condition': return '成功条件失败'
     case 'http': return 'HTTP状态错误'
     default: return '未知错误'
-  }
-}
-
-// 获取错误类型徽章样式类
-const getErrorTypeBadgeClass = (errorType: string) => {
-  switch (errorType) {
-    case 'network': return 'error-badge-network'
-    case 'parsing': return 'error-badge-parsing'
-    case 'condition': return 'error-badge-condition'
-    case 'http': return 'error-badge-http'
-    default: return 'error-badge-unknown'
   }
 }
 
@@ -688,16 +670,7 @@ const getOperatorText = (operator: string) => {
   }
 }
 
-// 判断是否为否定条件（包含"不"的条件）
-const isNegativeCondition = (operator: string) => {
-  const operatorText = getOperatorText(operator)
-  return operatorText.includes('不')
-}
 
-// 切换错误详情显示
-const toggleErrorDetails = (requestId: string) => {
-  showErrorDetails.value[requestId] = !showErrorDetails.value[requestId]
-}
 
 // 获取简化的错误摘要
 const getSimplifiedErrorSummary = (request: any) => {
@@ -730,6 +703,109 @@ const getSimplifiedErrorSummary = (request: any) => {
   }
 }
 
+// 对失败日志进行分组聚合
+const groupFailedRequests = (detailedLogs: any[]) => {
+  const failedRequests = detailedLogs.filter(log => !log.success)
+  const groups: Record<string, any[]> = {}
+
+  failedRequests.forEach(request => {
+    const errorSummary = getSimplifiedErrorSummary(request)
+    if (!groups[errorSummary]) {
+      groups[errorSummary] = []
+    }
+    groups[errorSummary].push(request)
+  })
+
+  return groups
+}
+
+// 对成功日志进行分组聚合
+const groupSuccessRequests = (detailedLogs: any[]) => {
+  const successRequests = detailedLogs.filter(log => log.success)
+  const groups: Record<string, any[]> = {}
+
+  successRequests.forEach(request => {
+    let successSummary = '请求成功'
+    if (request.successConditionDetails) {
+      const conditionType = getConditionTypeText(request.successConditionDetails.type)
+      if (request.successConditionDetails.jsonPath) {
+        successSummary = `${conditionType}成功 (${request.successConditionDetails.jsonPath})`
+      } else {
+        successSummary = `${conditionType}成功`
+      }
+    }
+
+    if (!groups[successSummary]) {
+      groups[successSummary] = []
+    }
+    groups[successSummary].push(request)
+  })
+
+  return groups
+}
+
+// 切换失败分组的展开状态
+const toggleFailureGroup = (logEntryId: string, errorSummary: string) => {
+  const key = `${logEntryId}_${errorSummary}`
+  expandedFailureGroups.value[key] = !expandedFailureGroups.value[key]
+}
+
+// 格式化JSON响应内容
+const formatJsonContent = (content: string) => {
+  if (!formatJsonResponse.value) {
+    return content
+  }
+
+  try {
+    // 尝试解析JSON
+    const parsed = JSON.parse(content)
+    // 格式化输出，缩进2个空格
+    return JSON.stringify(parsed, null, 2)
+  } catch (error) {
+    // 如果不是有效的JSON，返回原内容
+    return content
+  }
+}
+
+// 获取详细的成功/失败原因说明
+const getDetailedReasonText = (request: any) => {
+  if (request.success) {
+    // 成功的情况
+    if (request.successConditionDetails) {
+      const conditionType = getConditionTypeText(request.successConditionDetails.type)
+      const operator = getOperatorText(request.successConditionDetails.operator)
+      const expectedValue = request.successConditionDetails.expectedValue
+      const actualValue = request.successConditionDetails.actualValue
+
+      if (request.successConditionDetails.jsonPath) {
+        return `成功原因：检查 '${actualValue}' ${operator} '${expectedValue}' (${request.successConditionDetails.jsonPath})`
+      } else {
+        return `成功原因：检查 '${actualValue}' ${operator} '${expectedValue}'`
+      }
+    } else {
+      return `成功原因：HTTP ${request.statusCode} 响应正常`
+    }
+  } else {
+    // 失败的情况
+    if (request.successConditionDetails && request.successConditionDetails.reason) {
+      const conditionType = getConditionTypeText(request.successConditionDetails.type)
+      const operator = getOperatorText(request.successConditionDetails.operator)
+      const expectedValue = request.successConditionDetails.expectedValue
+      const actualValue = request.successConditionDetails.actualValue
+
+      if (request.successConditionDetails.jsonPath) {
+        return `失败原因：检查 '${actualValue}' ${operator} '${expectedValue}' (${request.successConditionDetails.jsonPath})`
+      } else {
+        return `失败原因：检查 '${actualValue}' ${operator} '${expectedValue}'`
+      }
+    } else if (request.error) {
+      return `失败原因：${request.error}`
+    } else {
+      return `失败原因：HTTP ${request.statusCode || 'ERROR'} 错误`
+    }
+  }
+}
+
 const refreshLogs = async (taskId: string) => {
   await loadTaskLogEntries(taskId)
 }
@@ -749,14 +825,27 @@ defineExpose({
 
 const clearLogs = async (taskId: string) => {
   if (confirm('确定要清空该任务的所有日志吗？')) {
-    // 这里可以添加清空日志的后端API调用
-    taskLogEntries.value[taskId] = []
-    // 清空相关的详细日志
-    Object.keys(executionLogs.value).forEach(key => {
-      if (key.startsWith(taskId)) {
-        delete executionLogs.value[key]
-      }
-    })
+    try {
+      // 调用后端API清空日志
+      const { ClearTaskLogs } = await import('../../wailsjs/go/main/App')
+      const result = await ClearTaskLogs(taskId)
+
+      // 清空前端显示的日志数据
+      taskLogEntries.value[taskId] = []
+
+      // 清空相关的详细日志
+      Object.keys(executionLogs.value).forEach(key => {
+        if (key.startsWith(taskId)) {
+          delete executionLogs.value[key]
+        }
+      })
+
+      // 显示成功消息
+      showQuickEditMessage(result, 'success')
+    } catch (error) {
+      console.error('清空日志失败:', error)
+      showQuickEditMessage(`清空日志失败: ${error}`, 'error')
+    }
   }
 }
 
@@ -1816,6 +1905,26 @@ const extractSuccessCount = (result: string): string => {
   width: 120px;
 }
 
+.json-format-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: #495057;
+  cursor: pointer;
+  user-select: none;
+}
+
+.json-format-checkbox input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+.checkbox-label {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
 .btn-refresh, .btn-clear {
   padding: 4px 8px;
   border: 1px solid #dee2e6;
@@ -2032,25 +2141,6 @@ const extractSuccessCount = (result: string): string => {
   margin-bottom: 4px;
 }
 
-.request-method {
-  padding: 2px 6px;
-  background: #007bff;
-  color: white;
-  border-radius: 3px;
-  font-size: 0.7rem;
-  font-weight: 500;
-  min-width: 45px;
-  text-align: center;
-}
-
-.request-url {
-  font-family: 'Courier New', monospace;
-  font-size: 0.75rem;
-  color: #495057;
-  flex: 1;
-  word-break: break-all;
-}
-
 .request-status {
   padding: 2px 6px;
   border-radius: 3px;
@@ -2071,6 +2161,278 @@ const extractSuccessCount = (result: string): string => {
   color: #6c757d;
   min-width: 50px;
   text-align: right;
+  margin-left: 8px;
+}
+
+.request-result-indicator {
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  margin-left: 8px;
+  min-width: 35px;
+  text-align: center;
+}
+
+.request-result-indicator.success {
+  background: #d4edda;
+  color: #155724;
+}
+
+.request-result-indicator.failed {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+/* 失败日志聚合样式 */
+.failure-groups {
+  margin-bottom: 12px;
+  border: 1px solid #f8d7da;
+  border-radius: 6px;
+  background: #fff5f5;
+}
+
+.failure-groups-header {
+  padding: 8px 12px;
+  background: #f8d7da;
+  border-bottom: 1px solid #f5c6cb;
+  border-radius: 6px 6px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.failure-groups-title {
+  font-weight: 600;
+  color: #721c24;
+  font-size: 0.85rem;
+}
+
+.failure-groups-count {
+  font-size: 0.75rem;
+  color: #856404;
+  background: #fff3cd;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.failure-group {
+  border-bottom: 1px solid #f5c6cb;
+}
+
+.failure-group:last-child {
+  border-bottom: none;
+}
+
+.failure-group-header {
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background-color 0.2s;
+}
+
+.failure-group-header:hover {
+  background: #f5c6cb;
+}
+
+.failure-icon {
+  font-size: 0.9rem;
+}
+
+.failure-summary {
+  flex: 1;
+  font-size: 0.8rem;
+  color: #721c24;
+  font-weight: 500;
+}
+
+.failure-count {
+  font-size: 0.75rem;
+  color: #856404;
+  background: #fff3cd;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.expand-icon {
+  font-size: 0.7rem;
+  color: #6c757d;
+}
+
+.failure-group-details {
+  padding: 8px 12px;
+  background: #ffffff;
+  border-top: 1px solid #f5c6cb;
+}
+
+.failure-detail-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f8f9fa;
+}
+
+.failure-detail-item:last-child {
+  border-bottom: none;
+}
+
+.failure-detail-status {
+  padding: 2px 6px;
+  background: #dc3545;
+  color: white;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  min-width: 35px;
+  text-align: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.failure-detail-reason {
+  flex: 1;
+  font-size: 0.75rem;
+  color: #495057;
+  line-height: 1.4;
+  padding: 2px 4px;
+  background: #f8f9fa;
+  border-radius: 3px;
+  border-left: 3px solid #dc3545;
+  font-family: 'Courier New', monospace;
+}
+
+.failure-detail-time {
+  font-size: 0.7rem;
+  color: #6c757d;
+  min-width: 50px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+/* 成功日志聚合样式 */
+.success-groups {
+  margin-bottom: 12px;
+  border: 1px solid #d4edda;
+  border-radius: 6px;
+  background: #f8fff9;
+}
+
+.success-groups-header {
+  padding: 8px 12px;
+  background: #d4edda;
+  border-bottom: 1px solid #c3e6cb;
+  border-radius: 6px 6px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.success-groups-title {
+  font-weight: 600;
+  color: #155724;
+  font-size: 0.85rem;
+}
+
+.success-groups-count {
+  font-size: 0.75rem;
+  color: #155724;
+  background: #d1ecf1;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.success-group {
+  border-bottom: 1px solid #c3e6cb;
+}
+
+.success-group:last-child {
+  border-bottom: none;
+}
+
+.success-group-header {
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background-color 0.2s;
+}
+
+.success-group-header:hover {
+  background: #c3e6cb;
+}
+
+.success-icon {
+  font-size: 0.9rem;
+}
+
+.success-summary {
+  flex: 1;
+  font-size: 0.8rem;
+  color: #155724;
+  font-weight: 500;
+}
+
+.success-count {
+  font-size: 0.75rem;
+  color: #155724;
+  background: #d1ecf1;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.success-group-details {
+  padding: 8px 12px;
+  background: #ffffff;
+  border-top: 1px solid #c3e6cb;
+}
+
+.success-detail-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f8f9fa;
+}
+
+.success-detail-item:last-child {
+  border-bottom: none;
+}
+
+.success-detail-status {
+  padding: 2px 6px;
+  background: #28a745;
+  color: white;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  min-width: 35px;
+  text-align: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.success-detail-reason {
+  flex: 1;
+  font-size: 0.75rem;
+  color: #495057;
+  line-height: 1.4;
+  padding: 2px 4px;
+  background: #f8f9fa;
+  border-radius: 3px;
+  border-left: 3px solid #28a745;
+  font-family: 'Courier New', monospace;
+}
+
+.success-detail-time {
+  font-size: 0.7rem;
+  color: #6c757d;
+  min-width: 50px;
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
 .request-error {

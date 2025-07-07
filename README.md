@@ -1,19 +1,167 @@
-# README
+# MyUI - HTTP任务执行与调度管理工具
 
-## About
+一个基于Wails框架开发的跨平台桌面应用程序，专为HTTP任务的批量执行、定时调度和日志管理而设计。
 
-This is the official Wails Vue-TS template.
+## 🚀 项目简介
 
-You can configure the project by editing `wails.json`. More information about the project settings can be found
-here: https://wails.io/docs/reference/project-config
+MyUI是一个功能强大的HTTP任务管理工具，提供直观的图形界面来创建、管理和执行HTTP请求任务。支持批量执行、多线程并发、定时调度、环境变量管理和详细的日志分析功能。
 
-## Live Development
+## ✨ 功能特性
 
-To run in live development mode, run `wails dev` in the project directory. This will run a Vite development
-server that will provide very fast hot reload of your frontend changes. If you want to develop in a browser
-and have access to your Go methods, there is also a dev server that runs on http://localhost:34115. Connect
-to this in your browser, and you can call your Go code from devtools.
+### 核心功能
+- **HTTP任务管理**：创建、编辑、删除和组织HTTP请求任务
+- **批量执行**：支持单个任务多次执行，可配置执行次数和并发线程数
+- **定时调度**：基于Cron表达式的定时任务调度（支持秒级精度）
+- **多线程并发**：可配置并发线程数，提高执行效率
+- **随机延迟**：支持请求间随机延迟，模拟真实用户行为
 
-## Building
+### 高级功能
+- **环境变量管理**：支持环境变量替换，可配置分隔符进行并行执行
+- **成功条件判断**：支持多种响应验证条件（状态码、JSON路径、字符串匹配等）
+- **标签分类**：任务标签管理，支持按标签筛选和组织
+- **任务测试**：单次请求测试功能，支持详细的响应分析
+- **数据导入导出**：任务配置的批量导入和导出
 
-To build a redistributable, production mode package, use `wails build`.
+### 日志与监控
+- **实时日志**：任务执行的实时日志记录和显示
+- **详细分析**：HTTP请求响应的详细记录（状态码、耗时、响应内容等）
+- **失败聚合**：智能的失败原因分组和统计
+- **JSON格式化**：响应内容的JSON格式化显示
+- **日志搜索**：支持日志内容的搜索和过滤
+
+## 🛠 技术栈
+
+### 后端
+- **Go 1.21+**：主要编程语言
+- **Wails v2**：跨平台桌面应用框架
+- **Cron v3**：定时任务调度库
+- **标准库**：HTTP客户端、JSON处理、文件操作等
+
+### 前端
+- **Vue 3**：现代化的前端框架
+- **TypeScript**：类型安全的JavaScript超集
+- **Vite**：快速的前端构建工具
+- **CSS3**：响应式UI设计
+
+### 开发工具
+- **Wails CLI**：项目构建和开发工具
+- **Go Modules**：依赖管理
+- **NPM/Yarn**：前端包管理
+
+## 📦 安装说明
+
+### 环境要求
+- Go 1.21或更高版本
+- Node.js 16或更高版本
+- Wails v2 CLI工具
+
+### 安装Wails CLI
+```bash
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+```
+
+### 克隆项目
+```bash
+git clone https://github.com/xlxzhc/gogogo.git
+cd myui
+```
+
+### 安装依赖
+```bash
+# 安装Go依赖
+go mod tidy
+
+# 安装前端依赖
+cd frontend
+npm install
+cd ..
+```
+
+## 🚀 使用方法
+
+### 开发模式
+在项目根目录运行以下命令启动开发模式：
+```bash
+wails dev
+```
+
+这将启动一个Vite开发服务器，提供热重载功能。同时会在 http://localhost:34115 启动一个开发服务器，可以在浏览器中访问并调用Go方法。
+
+### 构建应用
+构建生产版本的可执行文件：
+```bash
+wails build
+```
+
+构建完成后，可执行文件将位于 `build/bin/` 目录中。
+
+### 基本使用流程
+
+1. **创建任务**：
+   - 点击"新建任务"按钮
+   - 填写任务名称、URL、HTTP方法等基本信息
+   - 配置请求头、请求体和执行参数
+   - 设置成功条件和标签
+
+2. **执行任务**：
+   - 单次测试：点击"测试"按钮进行单次请求测试
+   - 批量执行：点击"执行"按钮开始批量执行
+   - 定时调度：配置Cron表达式并启用定时调度
+
+3. **查看日志**：
+   - 实时查看任务执行状态和进度
+   - 分析详细的请求响应日志
+   - 使用搜索和过滤功能快速定位问题
+
+## 🔧 开发指南
+
+### 项目结构
+```
+myui/
+├── app.go              # 主要的Go后端逻辑
+├── main.go             # 应用程序入口点
+├── wails.json          # Wails项目配置
+├── go.mod              # Go模块依赖
+├── frontend/           # Vue前端代码
+│   ├── src/
+│   │   ├── components/ # Vue组件
+│   │   ├── App.vue     # 主应用组件
+│   │   └── main.ts     # 前端入口
+│   ├── package.json    # 前端依赖配置
+│   └── vite.config.ts  # Vite构建配置
+├── build/              # 构建输出目录
+└── README.md           # 项目文档
+```
+
+### 添加新功能
+
+1. **后端功能**：
+   - 在 `app.go` 中添加新的方法
+   - 确保方法是公开的（首字母大写）
+   - 运行 `wails build` 重新生成前端绑定
+
+2. **前端功能**：
+   - 在 `frontend/src/components/` 中创建新组件
+   - 在 `App.vue` 中集成新组件
+   - 使用生成的绑定调用后端方法
+
+### 调试技巧
+
+- 使用 `wails dev` 进行开发时调试
+- 在浏览器开发者工具中查看前端日志
+- 在Go代码中使用 `fmt.Printf` 进行后端调试
+- 查看 `build/bin/` 目录中的日志文件
+
+## 📄 许可证
+
+本项目采用MIT许可证。详情请参阅 [LICENSE](LICENSE) 文件。
+
+## 🤝 贡献
+
+欢迎提交Issue和Pull Request来改进这个项目！
+
+## 📞 联系方式
+
+如有问题或建议，请通过以下方式联系：
+- GitHub Issues: [项目Issues页面](https://github.com/xlxzhc/gogogo/issues)
+- Email: 2297810074@qq.com

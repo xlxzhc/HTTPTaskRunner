@@ -855,6 +855,53 @@ func (a *App) GetExecutionLog(taskLogID string) *ExecutionLog {
 	return nil
 }
 
+// ClearTaskLogs 清空任务日志
+func (a *App) ClearTaskLogs(taskID string) string {
+	a.logMutex.Lock()
+	defer a.logMutex.Unlock()
+
+	if taskID == "all" {
+		// 清空所有任务的日志
+		a.taskLogs = make(map[string][]TaskLogEntry)
+		a.executionLogs = make(map[string]ExecutionLog)
+
+		// 保存清空后的日志到磁盘
+		go a.saveTaskLogs()
+		go a.saveExecutionLogs()
+
+		return "所有任务日志已清空"
+	} else {
+		// 清空指定任务的日志
+		if _, exists := a.taskLogs[taskID]; !exists {
+			return "任务日志不存在"
+		}
+
+		// 获取要删除的执行日志ID列表
+		var executionLogIDs []string
+		if logs, exists := a.taskLogs[taskID]; exists {
+			for _, log := range logs {
+				if log.ExecutionLogId != "" {
+					executionLogIDs = append(executionLogIDs, log.ExecutionLogId)
+				}
+			}
+		}
+
+		// 删除任务级别日志
+		delete(a.taskLogs, taskID)
+
+		// 删除对应的详细执行日志
+		for _, logID := range executionLogIDs {
+			delete(a.executionLogs, logID)
+		}
+
+		// 保存更新后的日志到磁盘
+		go a.saveTaskLogs()
+		go a.saveExecutionLogs()
+
+		return fmt.Sprintf("任务 '%s' 的日志已清空", taskID)
+	}
+}
+
 // getTaskLogPath 获取任务日志文件路径
 func (a *App) getTaskLogPath(taskID string) string {
 	exePath, err := os.Executable()
