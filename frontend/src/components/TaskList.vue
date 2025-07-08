@@ -361,9 +361,21 @@
                                     :key="index"
                                     class="failure-detail-item"
                                   >
-                                    <span class="failure-detail-status">{{ request.statusCode || 'ERROR' }}</span>
-                                    <div class="failure-detail-reason">{{ getDetailedReasonText(request) }}</div>
-                                    <span class="failure-detail-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                    <div class="detail-item-header">
+                                      <span class="failure-detail-status">{{ request.statusCode || 'ERROR' }}</span>
+                                      <div class="failure-detail-reason">{{ getDetailedReasonText(request) }}</div>
+                                      <span class="failure-detail-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                      <button
+                                        v-if="request.response"
+                                        @click="toggleResponseDetail(request.requestId)"
+                                        class="response-toggle-inline"
+                                      >
+                                        {{ showResponseDetails[request.requestId] ? '隐藏' : '详情' }}
+                                      </button>
+                                    </div>
+                                    <div v-if="request.response && showResponseDetails[request.requestId]" class="response-content">
+                                      <pre>{{ formatJsonContent(request.response) }}</pre>
+                                    </div>
                                   </div>
                                 </div>
                               </div>
@@ -392,43 +404,23 @@
                                     :key="index"
                                     class="success-detail-item"
                                   >
-                                    <span class="success-detail-status">{{ request.statusCode || 'OK' }}</span>
-                                    <div class="success-detail-reason">{{ getDetailedReasonText(request) }}</div>
-                                    <span class="success-detail-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                    <div class="detail-item-header">
+                                      <span class="success-detail-status">{{ request.statusCode || 'OK' }}</span>
+                                      <div class="success-detail-reason">{{ getDetailedReasonText(request) }}</div>
+                                      <span class="success-detail-time">{{ formatDuration(request.responseTime / 1000) }}</span>
+                                      <button
+                                        v-if="request.response"
+                                        @click="toggleResponseDetail(request.requestId)"
+                                        class="response-toggle-inline"
+                                      >
+                                        {{ showResponseDetails[request.requestId] ? '隐藏' : '详情' }}
+                                      </button>
+                                    </div>
+                                    <div v-if="request.response && showResponseDetails[request.requestId]" class="response-content">
+                                      <pre>{{ formatJsonContent(request.response) }}</pre>
+                                    </div>
                                   </div>
                                 </div>
-                              </div>
-                            </div>
-
-                            <div class="detailed-requests">
-                              <div
-                                v-for="(request, index) in executionLogs[logEntry.executionLogId].detailedLogs"
-                                :key="index"
-                                class="request-detail"
-                                :class="{ success: request.success, failed: !request.success }"
-                              >
-                                <div class="request-header">
-                                  <span class="request-status" :class="{ success: request.success, failed: !request.success }">
-                                    {{ request.statusCode || 'ERROR' }}
-                                  </span>
-                                  <span class="request-time">{{ formatDuration(request.responseTime / 1000) }}</span>
-                                  <span v-if="!request.success" class="request-result-indicator failed">失败</span>
-                                  <span v-else class="request-result-indicator success">成功</span>
-                                </div>
-
-                                <div v-if="request.response" class="request-response">
-                                  <button
-                                    @click="toggleResponseDetail(request.requestId)"
-                                    class="response-toggle"
-                                  >
-                                    {{ showResponseDetails[request.requestId] ? '隐藏响应' : '显示响应' }}
-                                  </button>
-                                  <div v-if="showResponseDetails[request.requestId]" class="response-content">
-                                    <pre>{{ formatJsonContent(request.response) }}</pre>
-                                  </div>
-                                </div>
-
-
                               </div>
                             </div>
                           </div>
@@ -618,10 +610,10 @@ const loadExecutionLog = async (logEntryId: string) => {
     if (executionLog) {
       executionLogs.value[logEntryId] = executionLog
 
-      // 默认展开所有响应详情
+      // 默认折叠所有响应详情
       if (executionLog.detailedLogs && executionLog.detailedLogs.length > 0) {
         executionLog.detailedLogs.forEach((log: any) => {
-          showResponseDetails.value[log.requestId] = true // 默认展开，用户可以查看响应详情
+          showResponseDetails.value[log.requestId] = false // 默认折叠，用户可以点击查看详情
         })
       }
     }
@@ -2269,10 +2261,16 @@ const extractSuccessCount = (result: string): string => {
 
 .failure-detail-item {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
   gap: 8px;
   padding: 6px 0;
   border-bottom: 1px solid #f8f9fa;
+}
+
+.detail-item-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .failure-detail-item:last-child {
@@ -2392,7 +2390,7 @@ const extractSuccessCount = (result: string): string => {
 
 .success-detail-item {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
   gap: 8px;
   padding: 6px 0;
   border-bottom: 1px solid #f8f9fa;
@@ -2474,6 +2472,24 @@ const extractSuccessCount = (result: string): string => {
 }
 
 .response-toggle:hover {
+  background: #e9ecef;
+}
+
+.response-toggle-inline {
+  padding: 1px 4px;
+  border: 1px solid #dee2e6;
+  background: white;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 0.65rem;
+  color: #007bff;
+  margin-left: 8px;
+  flex-shrink: 0;
+  height: fit-content;
+  align-self: center;
+}
+
+.response-toggle-inline:hover {
   background: #e9ecef;
 }
 
